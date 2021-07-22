@@ -12,34 +12,42 @@ class Optimizer:
     }
 
     def __init__(self,
-                 desc_rate, epsilon, n_frame,
                  cloth_model, cloth_sim,
-                 b_display,
-                 b_save_frame=True,
+                 desc_rate, epsilon, n_frame,
+                 ls_alpha=0.5, ls_gamma=0.03,
                  cg_precond="Jacobi",
                  cg_iter=100,
-                 cg_err=1e-6):
+                 cg_err=1e-6,
+                 b_display=False):
 
         assert n_frame >= 3
 
+        self.cloth_model = cloth_model
+        self.cloth_sim = cloth_sim
+
         self.desc_rate = desc_rate
         self.epsilon = epsilon
+        self.ls_alpha = ls_alpha
+        self.ls_gamma = ls_gamma
 
         self.n_frame = n_frame
         self.dt = cloth_sim.dt
         self.n_vert = cloth_sim.n_vert
         self.mass = cloth_sim.mass
 
-        self.cloth_model = cloth_model
-        self.cloth_sim = cloth_sim
-
         self.b_display = b_display
-        self.b_save_frame = b_save_frame
 
-        self.trajectory = [ti.Vector.field(3, float, self.n_vert) for _ in range(n_frame)]
-        self.control_force = [ti.Vector.field(3, float, self.n_vert) for _ in range(n_frame)]
+        self.trajectory = [ti.Vector.field(3, ti.f32, self.n_vert) for _ in range(n_frame)]
+        self.control_force = [ti.Vector.field(3, ti.f32, self.n_vert) for _ in range(n_frame)]
+        # In face 3 lambda are enough for computing
+        # but if we want to do line-search and have better initial guess for CG, we'd better remember them all
+        self.adjoint_vec = [ti.Vector.field(3, ti.f32, self.n_vert) for _ in range(n_frame)]
 
-        self.adjoint_vec = [ti.Vector.field(3, float, self.n_vert) for _ in range(3)]  # 3 lambda are enough
+        # line-search
+        self.loss = None
+        self.step_size = 1.0
+        self.gradient = [ti.Vector.field(3, ti.f32, self.n_vert) for _ in range(n_frame)]
+        self.tentetive_ctrl_f = [ti.Vector.field(3, ti.f32, self.n_vert) for _ in range(n_frame)]  # FIXME: can reduce to one Vector.field (w/ more complicate line-search)
 
         # linear solver variables
         self.cg_precond = self.CG_PRECOND_METHED[cg_precond]
@@ -52,17 +60,20 @@ class Optimizer:
         self.res = ti.field(ti.f32, shape=())
 
         if self.cg_precond == self.CG_PRECOND_METHED["Jacobi"]:
-            self.inv_A_diag = ti.Vector.field(3, dtype=ti.f32, shape=self.n_vert)
-        self.b = ti.Vector.field(3, dtype=ti.f32, shape=self.n_vert)
-        self.r = ti.Vector.field(3, dtype=ti.f32, shape=self.n_vert)
-        self.z = ti.Vector.field(3, dtype=ti.f32, shape=self.n_vert)
-        self.p = ti.Vector.field(3, dtype=ti.f32, shape=self.n_vert)
-        self.Ap = ti.Vector.field(3, dtype=ti.f32, shape=self.n_vert)
+            self.inv_A_diag = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.b = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.r = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.z = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.p = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.Ap = ti.Vector.field(3, ti.f32, self.n_vert)
 
     def initialize(self):
         for i in range(self.n_frame):
             self.trajectory[i].fill(0.0)
             self.control_force[i].fill(0.0)
+            self.adjoint_vec[i].fill(0.0)
+            self.gradient[i].fill(0.0)
+            self.tentetive_ctrl_f[i].fill(0.0)
 
     def save_trajectory(self, output_dir):
         """
@@ -76,42 +87,44 @@ class Optimizer:
         writer.add_faces(faces)
         writer.export(os.path.join(output_dir, "trajectory.ply"))
 
-    def save_frame(self, output_dir, frame, verts):
-        writer = ti.PLYWriter(self.n_vert, self.cloth_model.n_face, "tri")
-        writer.add_vertex_pos(verts[:, 0], verts[:, 1], verts[:, 2])
-        writer.add_faces(self.cloth_model.faces)
-        writer.export(os.path.join(output_dir, "frame_%i.ply" % frame))
+    def save_frame(self, output_dir):
+        """
+        Save the model per frame under checkpoint/timestamp/epoch_i/frame_i.ply
+        """
+        for i in range(self.n_frame):
+            writer = ti.PLYWriter(self.n_vert, self.cloth_model.n_face, "tri")
+            np_verts = self.trajectory[i].to_numpy()
+            writer.add_vertex_pos(np_verts[:, 0], np_verts[:, 1], np_verts[:, 2])
+            writer.add_faces(self.cloth_model.faces)
+            writer.export(os.path.join(output_dir, "frame_%i.ply" % i))
 
-    def forward(self, epoch, output_dir):
-        """ Run frames of simulation and record trajectory """
+    def __forward(self, control_force):
+        print("start forward")
+
         # reset initial states
         self.cloth_sim.x.from_numpy(self.cloth_model.verts)
         self.cloth_sim.v.fill(0.0)
 
         for i in range(self.n_frame):
-            self.cloth_sim.XPBD_step(self.control_force[i], self.trajectory[i])
-
-            # save updated positions
-            np_verts = self.trajectory[i].to_numpy()
+            self.cloth_sim.XPBD_step(control_force[i], self.trajectory[i])
             if self.b_display:
-                self.cloth_model.update_scene(np_verts)
-            if self.b_save_frame:
-                self.save_frame(output_dir, i, np_verts)
+                self.cloth_model.update_scene(self.trajectory[i].to_numpy())
+            print("[frame %i]" % i)
 
-            print("[epoch %i][frame %i]" % (epoch, i))
+    def forward(self):
+        """ Run frames of simulation """
+        self.__forward(self.control_force)
 
-        print("Finish forward.")
-
-    def loss(self):
+    def __loss(self, control_force):
         """
-        Compute loss (self.forward must be called before)
+        Compute loss (forward must be called before)
         L = 1/2 * M^2 / h^4 * ||q_{t+1} - q*||^2 + 1/2 * \epsilon * ||p||^2
         """
         loss = 0.0
 
         # regularization term
         for i in range(self.n_frame):
-            reduce(self.sum, self.control_force[i], self.control_force[i])
+            reduce(self.sum, control_force[i], control_force[i])
             loss += self.sum[None]
         loss *= 0.5 * self.epsilon
 
@@ -124,13 +137,58 @@ class Optimizer:
         return loss
 
     @ti.kernel
-    def update_control_force(self, control_force: ti.template()):
+    def __compute_gradient(self, g: ti.template(), ctrl_f: ti.template(), L: ti.template()):
         # dLdp = \epsilon * p + h^2 * \lambda
         for i in range(self.n_vert):
-            control_force[i] -= self.desc_rate * (self.epsilon * control_force[i] + self.dt ** 2 * self.adjoint_vec[0][i])
+            g[i] = self.epsilon * ctrl_f[i] + self.dt ** 2 * L[i]
+
+    def line_search(self):
+        """ Find a proper step size.
+        This method will invoke forward simulation several times, so don't need to call forward() explicitly anymore
+        """
+        # compute line search threshold
+        if not self.loss:  # first epoch
+            self.loss = self.__loss(self.control_force)
+        threshold = 0.0
+        for i in range(self.n_frame):
+            # compute dLdp
+            self.__compute_gradient(self.gradient[i], self.control_force[i], self.adjoint_vec[i])
+            reduce(self.sum, self.gradient[i], self.gradient[i])
+            threshold += self.sum[None]
+        threshold *= self.ls_gamma * self.desc_rate
+
+        # line-search
+        step_size = min(1.0, self.step_size / self.ls_alpha)  # use step size from last epoch as initial guess
+        b_converge = False
+        while True:
+            for i in range(self.n_frame):
+                self.tentetive_ctrl_f[i].copy_from(self.control_force[i])
+                axpy(-step_size * self.desc_rate, self.gradient[i], self.tentetive_ctrl_f[i])
+
+            # update trajectory
+            self.__forward(self.tentetive_ctrl_f)
+            cur_loss = self.__loss(self.tentetive_ctrl_f)
+
+            print("step size: %f  loss: %.3ef" % (step_size, cur_loss))
+
+            if cur_loss < self.loss + step_size * threshold:  # right step size
+                break
+            step_size *= self.ls_alpha
+            if step_size < 1e-5:
+                b_converge = True
+                break
+
+        # commit control force
+        self.step_size = step_size
+        self.loss = cur_loss
+        for i in range(self.n_frame):
+            self.control_force[i].copy_from(self.tentetive_ctrl_f[i])
+
+        return b_converge
 
     def backward(self):
         """ Update control forces """
+        # compute lambda
         for i in range(self.n_frame - 1, -1, -1):
             # prepare A
             self.cloth_sim.compute_hessian(self.trajectory[i])
@@ -145,26 +203,20 @@ class Optimizer:
                 # print_field(self.b)
             elif i == self.n_frame - 2:  # b_{t-1} = 2 * M * lambda_t
                 self.b.fill(0.0)
-                axpy(2 * self.mass, self.adjoint_vec[1], self.b)
-            else:  # b_{i+1} = 2 * M * lambda_i - M * lambda_{i+1}
+                axpy(2 * self.mass, self.adjoint_vec[i + 1], self.b)
+            else:  # b_i = 2 * M * lambda_{i+1} - M * lambda_{i+2}
                 self.b.fill(0.0)
-                axpy(2 * self.mass, self.adjoint_vec[1], self.b)
-                axpy(-self.mass, self.adjoint_vec[2], self.b)
+                axpy(2 * self.mass, self.adjoint_vec[i + 1], self.b)
+                axpy(-self.mass, self.adjoint_vec[i + 2], self.b)
 
             # linear solve
-            self.conjugate_gradient()
+            self.conjugate_gradient(self.adjoint_vec[i])
 
-            # update control force
-            self.update_control_force(self.control_force[i])
+        # update control forces (gradient descent with line search)
+        print("start line-search")
+        b_converge = self.line_search()
 
-            # move lambda
-            # print("lambda: ")
-            # print_field(self.adjoint_vec[0])
-            # print("control force: ")
-            # print_field(self.control_force[i])
-            self.adjoint_vec[2].copy_from(self.adjoint_vec[1])
-            self.adjoint_vec[1].copy_from(self.adjoint_vec[0])
-
+        return b_converge
 
     @ti.kernel
     def update_preconditioner(self):
@@ -174,16 +226,19 @@ class Optimizer:
                 self.inv_A_diag[i][j] = 1.0 / A[i, i][j, j]
 
     @ti.kernel
-    def compute_Ap(self):
+    def compute_Ap(self, x: ti.template()):
         A = ti.static(self.cloth_sim.hessian)
         for i, j in A:
-            self.Ap[i] += A[i, j] @ self.p[j]
+            self.Ap[i] += A[i, j] @ x[j]
 
-    def conjugate_gradient(self):
-        x = ti.static(self.adjoint_vec[0])  # alias
-
-        x.fill(0.0)  # TODO: maybe some better initial guess
+    def conjugate_gradient(self, x):
+        # r = b - Ax (x's initial value is lambda from last epoch)
         self.r.copy_from(self.b)
+        self.Ap.fill(0.0)
+        self.compute_Ap(x)
+        axpy(-1.0, self.Ap, self.r)
+
+        # z and p
         if self.cg_precond == self.CG_PRECOND_METHED["Jacobi"]:
             self.update_preconditioner()
             element_wist_mul(self.inv_A_diag, self.r, self.z)
@@ -196,7 +251,7 @@ class Optimizer:
 
         for i in range(self.cg_iter):
             self.Ap.fill(0.0)
-            self.compute_Ap()
+            self.compute_Ap(self.p)
 
             # alpha
             reduce(self.sum, self.p, self.Ap)
@@ -208,7 +263,7 @@ class Optimizer:
 
             reduce(self.res, self.r, self.r)
             if self.res[None] < self.cg_err:
-                print("[CG converge] iter: %i, err: %f" % (i, self.res[None]))
+                print("[CG converge] iter: %i, err: %.1ef" % (i, self.res[None]))
                 break
 
             if self.cg_precond == self.CG_PRECOND_METHED["Jacobi"]:

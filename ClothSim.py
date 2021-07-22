@@ -17,8 +17,8 @@ class ClothSim:
         self.inv_mass = 1.0 / mass
         self.gravity = ti.Vector([0.0, -9.8, 0.0])
 
-        self.x = ti.Vector.field(3, float, self.n_vert)
-        self.v = ti.Vector.field(3, float, self.n_vert)
+        self.x = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.v = ti.Vector.field(3, ti.f32, self.n_vert)
 
         # construct constraints
         ## mass-spring
@@ -27,9 +27,9 @@ class ClothSim:
             self.k_spring = k_spring
             self.spring_alpha = 1.0 / (k_spring * dt ** 2)  # compliant
             self.n_spring_con = cloth_model.n_edge
-            self.spring_idx = ti.Vector.field(2, int)
-            self.spring_l0 = ti.field(float)
-            self.spring_lambda = ti.field(float)
+            self.spring_idx = ti.Vector.field(2, ti.i32)
+            self.spring_l0 = ti.field(ti.f32)
+            self.spring_lambda = ti.field(ti.f32)
             ti.root.dense(ti.i, self.n_spring_con).place(self.spring_idx, self.spring_l0, self.spring_lambda)
         ## stretch
         self.use_stretch = use_stretch
@@ -37,8 +37,8 @@ class ClothSim:
             self.k_stretch = k_stretch
             self.stretch_alpha = 1.0 / (k_stretch * dt ** 2)
             self.n_stretch_con = cloth_model.n_face
-            self.stretch_idx = ti.Vector.field(3, int)
-            self.stretch_lambda = ti.field(float)
+            self.stretch_idx = ti.Vector.field(3, ti.i32)
+            self.stretch_lambda = ti.field(ti.f32)
             ti.root.dense(ti.i, self.n_stretch_con).place(self.stretch_idx, self.stretch_lambda)
         ## bend
         self.use_bend = use_bend
@@ -46,12 +46,12 @@ class ClothSim:
             self.k_bend = k_bend
             self.bend_alpha = 1.0 / (k_bend * dt ** 2)
             self.n_bend_con = cloth_model.n_inner_edge
-            self.bend_idx = ti.Vector.field(4, int)
-            self.bend_lambda = ti.field(float)
+            self.bend_idx = ti.Vector.field(4, ti.i32)
+            self.bend_lambda = ti.field(ti.f32)
             ti.root.dense(ti.i, self.n_bend_con).place(self.bend_idx, self.bend_lambda)
 
         # Hessian matrix
-        self.hessian = ti.Matrix.field(3, 3, float)
+        self.hessian = ti.Matrix.field(3, 3, ti.f32)
         ti.root.pointer(ti.ij, self.n_vert).place(self.hessian)
 
     @ti.kernel
