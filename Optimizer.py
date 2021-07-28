@@ -92,13 +92,15 @@ class Optimizer:
         """
         Save a whole trajectory under checkpoint/timestamp/epoch_i/trajectory.ply
         """
-        writer = ti.PLYWriter(self.n_frame * self.n_vert, self.n_frame * self.cloth_model.n_face, "tri")
+        writer = ti.PLYWriter((self.n_frame + 1) * self.n_vert, (self.n_frame + 1) * self.cloth_model.n_face, "tri")
 
-        np_traj = self.trajectory.to_numpy().reshape(-1, 3)
-        faces = np.tile(self.cloth_model.faces.flatten(), self.n_frame) + \
-                np.repeat(self.n_vert * np.arange(self.n_frame), 3 * self.cloth_model.n_face)
+        np_traj = np.vstack([self.cloth_model.verts, self.trajectory.to_numpy().reshape(-1, 3)])
+        faces = np.tile(self.cloth_model.faces.flatten(), self.n_frame + 1) + \
+                np.repeat(self.n_vert * np.arange(self.n_frame + 1), 3 * self.cloth_model.n_face)
+        np_force = np.vstack([self.control_force.to_numpy().reshape(-1, 3), np.zeros((self.n_vert, 3))])
 
         writer.add_vertex_pos(np_traj[:, 0], np_traj[:, 1], np_traj[:, 2])
+        writer.add_vertex_normal(np_force[:, 0], np_force[:, 1], np_force[:, 2])
         writer.add_faces(faces)
         writer.export(os.path.join(output_dir, "trajectory.ply"))
 
@@ -106,13 +108,23 @@ class Optimizer:
         """
         Save the model per frame under checkpoint/timestamp/epoch_i/frame_i.ply
         """
-        for i in range(self.n_frame):
+        for i in range(self.n_frame + 1):
             writer = ti.PLYWriter(self.n_vert, self.cloth_model.n_face, "tri")
 
-            self.get_frame(self.trajectory, i)
-            np_verts = self.tmp_vec.to_numpy()
+            if i == 0:
+                np_verts = self.cloth_model.verts
+            else:
+                self.get_frame(self.trajectory, i - 1)
+                np_verts = self.tmp_vec.to_numpy()
+
+            if i == self.n_frame:
+                np_force = np.zeros((self.n_vert, 3))
+            else:
+                self.get_frame(self.control_force, i)
+                np_force = self.tmp_vec.to_numpy()
 
             writer.add_vertex_pos(np_verts[:, 0], np_verts[:, 1], np_verts[:, 2])
+            writer.add_vertex_normal(np_force[:, 0], np_force[:, 1], np_force[:, 2])
             writer.add_faces(self.cloth_model.faces)
             writer.export_frame(i, os.path.join(output_dir, "frame"))
 
@@ -165,6 +177,7 @@ class Optimizer:
         # compute line search threshold
         if not self.loss:  # first epoch
             self.loss, self.x_loss, self.f_loss = self.__compute_loss(self.control_force)
+            print("[init loss] %.2ef (%.1ef / %.1ef)" % (self.loss, self.x_loss, self.f_loss))
         self.__compute_gradient()
         reduce(self.sum, self.gradient, self.gradient)
         threshold = self.ls_gamma * self.desc_rate * self.sum[None]

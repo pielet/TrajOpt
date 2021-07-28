@@ -34,9 +34,9 @@ k_spring = 1000
 k_attach = 1e5
 
 # optimization params
-n_epoch = 50
+n_epoch = 5
 desc_rate = 0.5
-smoothness = 0.1
+smoothness = 1
 cg_precond = "None"
 
 # create scene (allocate memory)
