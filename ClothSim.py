@@ -1,24 +1,27 @@
 import taichi as ti
-from FieldUtil import scale, print_field
+from FieldUtil import *
 
 
 @ti.data_oriented
 class ClothSim:
     def __init__(self,
                  cloth_model, dt, n_iter,
-                 use_spring, use_stretch, use_bend,
-                 k_spring=0.0, k_stretch=0.0, k_bend=0.0,
-                 mass=1.0):
+                 use_spring, use_stretch, use_bend, use_attach,
+                 k_spring=0.0, k_stretch=0.0, k_bend=0.0, k_attach=0.0,
+                 density=1.5):  # g/cm^2
         self.cloth_model = cloth_model
         self.n_vert = cloth_model.n_vert
+        self.n_face = cloth_model.n_face
         self.dt = dt
         self.n_iter = n_iter
-        self.mass = mass
-        self.inv_mass = 1.0 / mass
+        self.density = density
         self.gravity = ti.Vector([0.0, -9.8, 0.0])
 
         self.x = ti.Vector.field(3, ti.f32, self.n_vert)
         self.v = ti.Vector.field(3, ti.f32, self.n_vert)
+
+        self.face_idx = ti.Vector.field(3, ti.i32, self.n_face)  # for mass computation
+        self.total_area = ti.field(ti.f32, ())
 
         # construct constraints
         ## mass-spring
@@ -49,10 +52,28 @@ class ClothSim:
             self.bend_idx = ti.Vector.field(4, ti.i32)
             self.bend_lambda = ti.field(ti.f32)
             ti.root.dense(ti.i, self.n_bend_con).place(self.bend_idx, self.bend_lambda)
+        ## attach
+        self.use_attach = use_attach
+        if use_attach:
+            self.k_attach = k_attach
+            self.attach_alpha = 1.0 / (k_attach * dt ** 2)
+            self.n_attach_con = cloth_model.n_fixed
+            self.attach_idx = ti.field(ti.i32)
+            self.attach_target = ti.Vector.field(3, ti.f32)
+            self.attach_lambda = ti.field(ti.f32)
+            ti.root.dense(ti.i, self.n_attach_con).place(self.attach_idx, self.attach_target, self.attach_lambda)
 
         # Hessian matrix
         self.hessian = ti.Matrix.field(3, 3, ti.f32)
         ti.root.pointer(ti.ij, self.n_vert).place(self.hessian)
+
+    @ti.kernel
+    def compute_total_area(self):
+        self.total_area[None] = 0.0
+        for i in range(self.n_face):
+            i0, i1, i2 = self.face_idx[i][0], self.face_idx[i][1], self.face_idx[i][2]
+            x0, x1, x2 = self.x[i0], self.x[i1], self.x[i2]
+            self.total_area[None] += 0.5 * (x1 - x0).cross(x2 - x0).norm()
 
     @ti.kernel
     def init_spring_con(self):
@@ -69,10 +90,22 @@ class ClothSim:
     def init_bend_con(self):
         pass
 
+    @ti.kernel
+    def init_attach_con(self):
+        for i in range(self.n_attach_con):
+            self.attach_target[i] = self.x[self.attach_idx[i]]
+
     def initialize(self):
         self.x.from_numpy(self.cloth_model.verts)
         self.v.fill(0.0)
 
+        # compute mass
+        self.face_idx.from_numpy(self.cloth_model.faces)
+        self.compute_total_area()
+        self.mass = self.density * self.total_area[None] / self.n_vert
+        self.inv_mass = 1.0 / self.mass
+
+        # init constrain
         if self.use_spring:
             self.spring_idx.from_numpy(self.cloth_model.edges)
             self.init_spring_con()
@@ -82,6 +115,9 @@ class ClothSim:
         if self.use_bend:
             self.bend_idx.from_numpy(self.cloth_model.inner_edges)
             self.init_bend_con()
+        if self.use_attach:
+            self.attach_idx.from_numpy(self.cloth_model.fixed_idx)
+            self.init_attach_con()
 
     @ti.kernel
     def prologue(self, ext_f: ti.template(), x_next: ti.template()):
@@ -100,7 +136,7 @@ class ClothSim:
             i0, i1 = self.spring_idx[i]
             x0, x1 = x[i0], x[i1]
 
-            n = (x0 - x1).normalized()
+            n = safe_normalized(x0 - x1)
             C = (x0 - x1).norm() - self.spring_l0[i]
 
             dL = -(C + self.spring_alpha * self.spring_lambda[i]) / (2 * self.inv_mass + self.spring_alpha)
@@ -116,6 +152,20 @@ class ClothSim:
     def solve_bend_con(self, x: ti.template()):
         pass
 
+    @ti.kernel
+    def solve_attach_con(self, x: ti.template()):
+        for i in range(self.n_attach_con):
+            pi = self.attach_idx[i]
+            xi = x[pi]
+            xt = self.attach_target[i]
+
+            C = (xi - xt).norm()
+            n = safe_normalized(xi - xt)
+
+            dL = -(C + self.attach_alpha * self.attach_lambda[i]) / (2 * self.inv_mass + self.attach_alpha)
+            self.spring_lambda[i] += dL
+            x[pi] += self.inv_mass * dL * n
+
     def XPBD_step(self, ext_f, x_next):
         """
         Run one step of forward simulation under the [ext_f: ti.Vector.field]
@@ -124,22 +174,26 @@ class ClothSim:
         # set initial pos
         self.prologue(ext_f, x_next)
         # print("[XPBD start]:")
-        # print_field(self.x)
+        # print_field(x_next)
+        # ti.sync()
 
         # reset lambda
         if self.use_spring: self.spring_lambda.fill(0.0)
         if self.use_stretch: self.stretch_lambda.fill(0.0)
         if self.use_bend: self.bend_lambda.fill(0.0)
+        if self.use_attach: self.attach_lambda.fill(0.0)
 
         for i in range(self.n_iter):
             if self.use_spring: self.solve_spring_con(x_next)
             if self.use_stretch: self.solve_stretch_con(x_next)
             if self.use_bend: self.solve_bend_con(x_next)
+            if self.use_attach: self.solve_attach_con(x_next)
 
         # commit pos and vel
         self.epilogue(x_next)
         # print("[XPBD end]: ")
         # print_field(self.x)
+        # ti.sync()
 
     @ti.kernel
     def compute_spring_hessian(self, x: ti.template()):
@@ -150,7 +204,7 @@ class ClothSim:
             l0 = self.spring_l0[i]
             l = (x0 - x1).norm()
 
-            local_H = self.k_spring * ((1.0 - l0 / l) * ti.Matrix.identity(float, 3)
+            local_H = self.k_spring * ((1.0 - l0 / l) * ti.Matrix.identity(ti.f32, 3)
                                        + l0 / l ** 3 * (x0 - x1) @ (x0 - x1).transpose())
 
             self.hessian[i0, i0] += local_H
@@ -165,6 +219,12 @@ class ClothSim:
     @ti.kernel
     def compute_bend_hessian(self, x: ti.template()):
         pass
+
+    @ti.kernel
+    def compute_attach_hessian(self, x: ti.template()):
+        for i in range(self.n_attach_con):
+            idx = self.attach_idx[i]
+            self.hessian[idx, idx] += self.k_attach * ti.Matrix.identity(ti.f32, 3)
 
     @ti.kernel
     def reset_hessian(self):
@@ -185,6 +245,10 @@ class ClothSim:
         if self.use_spring: self.compute_spring_hessian(x)
         if self.use_stretch: self.compute_stretch_hessian(x)
         if self.use_bend: self.compute_bend_hessian(x)
+        if self.use_attach: self.compute_attach_hessian(x)
 
         scale(self.hessian, self.dt ** 2)
         self.add_in_diagonal(self.mass)
+
+        # print_field(self.hessian)
+        # ti.sync()

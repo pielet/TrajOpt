@@ -1,18 +1,24 @@
 import os
+import json
 import numpy as np
 import taichi as ti
 import tina
 
 
 class ClothModel:
-    def __init__(self, input_model, target_model, output_dir):
-        self.verts, self.faces = tina.readobj(input_model, simple=True)
-        self.target_verts, _ = tina.readobj(target_model, simple=True)  # assume target and initial model have the same topology
+    def __init__(self, input_json):
+        with open(input_json, 'r') as f:
+            input = json.load(f)
+
+        self.verts, self.faces = tina.readobj(input["init"], simple=True)
+        self.target_verts, _ = tina.readobj(input["target"], simple=True)  # assume target and initial model have the same topology
+        self.fixed_idx = np.array(input["fixed"])
 
         self.mesh = tina.ConnectiveMesh()
 
         self.n_vert = self.verts.shape[0]
         self.n_face = self.faces.shape[0]
+        self.n_fixed = self.fixed_idx.shape[0]
 
         # construct edge list
         edge_list = []
@@ -39,8 +45,6 @@ class ClothModel:
         self.n_inner_edge = len(inner_edge_list)
         self.inner_edges = np.array(inner_edge_list)
 
-        self.output_dir = output_dir
-
     def bind_scene(self, scene):
         scene.add_object(self.mesh, tina.Classic())
         self.mesh.set_vertices(self.verts)
@@ -48,23 +52,4 @@ class ClothModel:
 
     def update_scene(self, verts):
         self.mesh.set_vertices(verts)
-
-    def save_ply(self, epoch, frame):
-        """
-        Save self.verts into .ply file in folder checkpoints/timestamp
-        file name format: epoch_[epoch]/frame_[frame]
-        """
-        epoch_dir = os.path.join(self.output_dir, "epoch_%i" % epoch)
-
-        if not os.path.exists(epoch_dir):
-            os.makedirs(epoch_dir)
-
-        ply_path = os.path.join(epoch_dir, "frame_%i.ply" % frame)
-
-        # fill in data
-        writer = ti.PLYWriter(self.n_vert, self.n_face, "tri")
-        writer.add_vertex_pos(self.verts[:, 0], self.verts[:, 1], self.verts[:, 2])
-        writer.add_faces(self.faces.flatten())
-
-        writer.export_ascii(ply_path)
 

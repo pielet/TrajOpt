@@ -11,7 +11,7 @@ def axpy(a: ti.f32, x: ti.template(), y: ti.template()):
         y[I] += a * x[I]
 
 @ti.kernel
-def reduce(res: ti.template(), x: ti.template(), y:ti.template()):
+def reduce(res: ti.template(), x: ti.template(), y: ti.template()):
     res[None] = 0.0
     for I in ti.grouped(x):
         res[None] += x[I].dot(y[I])
@@ -24,5 +24,9 @@ def element_wist_mul(x: ti.template(), y: ti.template(), z: ti.template()):
 @ti.kernel
 def print_field(x: ti.template()):
     for I in ti.grouped(x):
-        print(x[I], end="")
+        print(I, x[I], end=" ")
     print('\n')
+
+@ti.func
+def safe_normalized(vec):
+    return vec / max(vec.norm(), 1e-12)
