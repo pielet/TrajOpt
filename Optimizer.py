@@ -148,7 +148,7 @@ class Optimizer:
     def __compute_loss(self, control_force):
         """
         Compute loss (forward must be called before)
-        L = 1/2 * M^2 / h^4 * ||q_{t+1} - q*||^2 + 1/2 * \epsilon * ||p||^2
+        L = 1/2 * (M / n_f / h^2)^2 * ||q_{t+1} - q*||^2 + 1/2 * \epsilon * ||p||^2
         """
         # regularization term
         reduce(self.sum, control_force, control_force)
@@ -159,7 +159,7 @@ class Optimizer:
         self.get_frame(self.trajectory, self.n_frame - 1)
         axpy(-1.0, self.tmp_vec, self.b)
         reduce(self.sum, self.b, self.b)
-        x_loss = 0.5 * self.mass ** 2 / self.dt ** 4 * self.sum[None]
+        x_loss = 0.5 * (self.mass / self.n_frame / self.dt ** 2) ** 2 * self.sum[None]
 
         return x_loss + f_loss, x_loss, f_loss
 
@@ -177,14 +177,13 @@ class Optimizer:
         # compute line search threshold
         if not self.loss:  # first epoch
             self.loss, self.x_loss, self.f_loss = self.__compute_loss(self.control_force)
-            print("[init loss] %.2ef (%.1ef / %.1ef)" % (self.loss, self.x_loss, self.f_loss))
+            print("[init loss] %f (%f / %f)" % (self.loss, self.x_loss, self.f_loss))
         self.__compute_gradient()
         reduce(self.sum, self.gradient, self.gradient)
         threshold = self.ls_gamma * self.desc_rate * self.sum[None]
 
         # line-search
         step_size = min(1.0, self.step_size / self.ls_alpha)  # use step size from last epoch as initial guess
-        b_converge = False
         while True:
             self.tentetive_ctrl_f.copy_from(self.control_force)
             axpy(-step_size * self.desc_rate, self.gradient, self.tentetive_ctrl_f)
@@ -193,7 +192,7 @@ class Optimizer:
             self.__forward(self.tentetive_ctrl_f)
             cur_loss, cur_x_loss, cur_f_loss = self.__compute_loss(self.tentetive_ctrl_f)
 
-            print("step size: %f  loss: %.2ef (%.1ef / %.1ef)" % (step_size, cur_loss, cur_x_loss, cur_f_loss))
+            print("step size: %f  loss: %.1f (%.1f / %.1f)" % (step_size, cur_loss, cur_x_loss, cur_f_loss))
 
             if cur_loss < self.loss + step_size * threshold:  # right step size
                 break
@@ -206,7 +205,7 @@ class Optimizer:
         self.loss, self.x_loss, self.f_loss = cur_loss, cur_x_loss, cur_f_loss
         self.control_force.copy_from(self.tentetive_ctrl_f)
 
-        return self.x_loss < 1e4
+        return self.x_loss < 1e-2
 
     def backward(self):
         """ Update control forces """
@@ -218,11 +217,10 @@ class Optimizer:
             self.cloth_sim.compute_hessian(self.tmp_vec)
 
             # prepare b
-            if i == self.n_frame - 1:  # b_t = M^2 / h^4 * (q_t - q*)
+            if i == self.n_frame - 1:  # b_t = M^2 / h^4 / n_f^2 * (q_t - q*)
                 self.b.from_numpy(self.cloth_model.target_verts)
-                M2h4 = self.mass ** 2 / self.dt ** 4
-                scale(self.b, -M2h4)
-                axpy(M2h4, self.tmp_vec, self.b)
+                axpy(-1.0, self.tmp_vec, self.b)
+                scale(self.b, -self.mass ** 2 / self.dt ** 4 / self.n_frame ** 2)
                 # print("last b:")
                 # print_field(self.b)
             elif i == self.n_frame - 2:  # b_{t-1} = 2 * M * lambda_t

@@ -34,9 +34,9 @@ k_spring = 1000
 k_attach = 1e5
 
 # optimization params
-n_epoch = 5
-desc_rate = 0.5
-smoothness = 1
+n_epoch = 10
+desc_rate = 5.0  # start step size
+smoothness = 0.1  # regularization
 cg_precond = "None"
 
 # create scene (allocate memory)
@@ -89,7 +89,7 @@ def optimize():
         os.makedirs(epoch_dir)
 
         b_converge = opt.backward()
-        print("[epoch %i] loss: %.2ef (%.1ef / %.1ef)" % (i, opt.loss, opt.x_loss, opt.f_loss))
+        print("[epoch %i] loss: %.1f (%.1f / %.1f)" % (i, opt.loss, opt.x_loss, opt.f_loss))
 
         if b_save_trajectory:
             opt.save_trajectory(epoch_dir)
