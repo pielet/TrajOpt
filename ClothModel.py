@@ -14,7 +14,8 @@ class ClothModel:
         self.target_verts, _ = tina.readobj(input["target"], simple=True)  # assume target and initial model have the same topology
         self.fixed_idx = np.array(input["fixed"])
 
-        self.mesh = tina.ConnectiveMesh()
+        self.mesh_model = tina.ConnectiveMesh()
+        self.wire_model = tina.MeshToWire(self.mesh_model)
 
         self.n_vert = self.verts.shape[0]
         self.n_face = self.faces.shape[0]
@@ -46,10 +47,11 @@ class ClothModel:
         self.inner_edges = np.array(inner_edge_list)
 
     def bind_scene(self, scene):
-        scene.add_object(self.mesh, tina.Classic())
-        self.mesh.set_vertices(self.verts)
-        self.mesh.set_faces(self.faces)
+        scene.add_object(self.mesh_model, tina.Classic())
+        scene.add_object(self.wire_model)
+        self.mesh_model.set_vertices(self.verts)
+        self.mesh_model.set_faces(self.faces)
 
     def update_scene(self, verts):
-        self.mesh.set_vertices(verts)
+        self.mesh_model.set_vertices(verts)
 

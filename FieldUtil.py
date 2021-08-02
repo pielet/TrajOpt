@@ -24,8 +24,7 @@ def element_wist_mul(x: ti.template(), y: ti.template(), z: ti.template()):
 @ti.kernel
 def print_field(x: ti.template()):
     for I in ti.grouped(x):
-        print(I, x[I], end=" ")
-    print('\n')
+        print(I, x[I], end="\n")
 
 @ti.func
 def safe_normalized(vec):

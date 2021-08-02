@@ -6,18 +6,10 @@ from FieldUtil import *
 
 @ti.data_oriented
 class Optimizer:
-    CG_PRECOND_METHED = {
-        "None": 0,
-        "Jacobi": 1
-    }
-
     def __init__(self,
-                 cloth_model, cloth_sim,
+                 cloth_model, cloth_sim, linear_solver,
                  desc_rate, smoothness, n_frame,
                  ls_alpha=0.5, ls_gamma=0.03,
-                 cg_precond="Jacobi",
-                 cg_iter=100,
-                 cg_err=1e-6,
                  b_verbose=False):
 
         assert n_frame >= 3
@@ -50,25 +42,11 @@ class Optimizer:
         self.gradient = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
         self.tentetive_ctrl_f = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))  # FIXME: can reduce to one Vector.field (w/ more complicate line-search)
 
-        self.tmp_vec = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.tmp_vec = ti.Vector.field(3, ti.f32, self.n_vert)  # to access one frame data
+        self.sum = ti.field(ti.f32, ())
 
-        # linear solver variables
-        self.cg_precond = self.CG_PRECOND_METHED[cg_precond]
-        self.cg_iter = cg_iter
-        self.cg_err = cg_err
-        self.alpha = ti.field(ti.f32, shape=())
-        self.beta = ti.field(ti.f32, shape=())
-        self.rTz = ti.field(ti.f32, shape=())
-        self.sum = ti.field(ti.f32, shape=())
-        self.res = ti.field(ti.f32, shape=())
-
-        if self.cg_precond == self.CG_PRECOND_METHED["Jacobi"]:
-            self.inv_A_diag = ti.Vector.field(3, ti.f32, self.n_vert)
-        self.b = ti.Vector.field(3, ti.f32, self.n_vert)
-        self.r = ti.Vector.field(3, ti.f32, self.n_vert)
-        self.z = ti.Vector.field(3, ti.f32, self.n_vert)
-        self.p = ti.Vector.field(3, ti.f32, self.n_vert)
-        self.Ap = ti.Vector.field(3, ti.f32, self.n_vert)
+        self.linear_solver = linear_solver
+        self.b = linear_solver.b
 
     def initialize(self):
         self.mass = self.cloth_sim.mass
@@ -129,17 +107,21 @@ class Optimizer:
             writer.export_frame(i, os.path.join(output_dir, "frame"))
 
     def __forward(self, control_force):
-        print("[start forward]")
+        print("[start forward]", end=" ")
 
         # reset initial states
         self.cloth_sim.x.from_numpy(self.cloth_model.verts)
         self.cloth_sim.v.fill(0.0)
 
+        frame, err = 0, 0
         for i in range(self.n_frame):
             self.get_frame(control_force, i)
-            self.cloth_sim.XPBD_step(self.tmp_vec, self.tmp_vec)  # FIXME: assume ext_f and x_next can be the same vector
+            fi, ei = self.cloth_sim.step(self.tmp_vec, self.tmp_vec)  # FIXME: assume ext_f and x_next can be the same vector
+            frame += fi
+            err += ei
             self.set_frame(self.trajectory, i)
-            if self.b_verbose: print("frame %i" % i)
+
+        print("avg.iter: %i, avg.err: %.1ef" % (frame / self.n_frame, err / self.n_frame))
 
     def forward(self):
         """ Run frames of simulation """
@@ -171,7 +153,7 @@ class Optimizer:
 
     def line_search(self):
         """
-        Find a proper step size.
+        Find a proper step size
         This method will invoke forward simulation several times, so don't need to call forward() explicitly anymore
         """
         # compute line search threshold
@@ -194,11 +176,9 @@ class Optimizer:
 
             print("step size: %f  loss: %.1f (%.1f / %.1f)" % (step_size, cur_loss, cur_x_loss, cur_f_loss))
 
-            if cur_loss < self.loss + step_size * threshold:  # right step size
+            if cur_loss < self.loss + step_size * threshold or step_size < 1e-5:
                 break
             step_size *= self.ls_alpha
-            if step_size < 1e-5:
-                break
 
         # commit control force
         self.step_size = step_size
@@ -209,8 +189,11 @@ class Optimizer:
 
     def backward(self):
         """ Update control forces """
+
         # compute lambda
-        print("[start backward]")
+        print("[start backward]", end=" ")
+
+        iter, err = 0, 0
         for i in range(self.n_frame - 1, -1, -1):
             # prepare A
             self.get_frame(self.trajectory, i)
@@ -220,7 +203,7 @@ class Optimizer:
             if i == self.n_frame - 1:  # b_t = M^2 / h^4 / n_f^2 * (q_t - q*)
                 self.b.from_numpy(self.cloth_model.target_verts)
                 axpy(-1.0, self.tmp_vec, self.b)
-                scale(self.b, -self.mass ** 2 / self.dt ** 4 / self.n_frame ** 2)
+                scale(self.b, -(self.mass / self.dt ** 2 / self.n_frame) ** 2)
                 # print("last b:")
                 # print_field(self.b)
             elif i == self.n_frame - 2:  # b_{t-1} = 2 * M * lambda_t
@@ -236,79 +219,15 @@ class Optimizer:
 
             # linear solve
             self.get_frame(self.adjoint_vec, i)
-            self.conjugate_gradient(self.tmp_vec)
+            iter_i, err_i = self.linear_solver.conjugate_gradient(self.tmp_vec)
             self.set_frame(self.adjoint_vec, i)
-            if self.b_verbose: print("lambda %i" % i)
+            iter += iter_i
+            err += err_i
+
+        print("CG avg.iter: %d, avg.err: %.1ef" % (iter / self.n_frame, err / self.n_frame))
 
         # update control forces (gradient descent with line search)
         print("[start line-search]")
         b_converge = self.line_search()
 
         return b_converge
-
-    @ti.kernel
-    def update_preconditioner(self):
-        A = ti.static(self.cloth_sim.hessian)
-        for i in range(self.n_vert):
-            for j in ti.static(range(3)):
-                self.inv_A_diag[i][j] = 1.0 / A[i, i][j, j]
-
-    @ti.kernel
-    def compute_Ap(self, x: ti.template()):
-        A = ti.static(self.cloth_sim.hessian)
-        for i, j in A:
-            self.Ap[i] += A[i, j] @ x[j]
-
-    def conjugate_gradient(self, x):
-        # r = b - Ax (x's initial value is lambda from last epoch)
-        self.r.copy_from(self.b)
-        self.Ap.fill(0.0)
-        self.compute_Ap(x)
-        axpy(-1.0, self.Ap, self.r)
-
-        # z and p
-        if self.cg_precond == self.CG_PRECOND_METHED["Jacobi"]:
-            self.update_preconditioner()
-            element_wist_mul(self.inv_A_diag, self.r, self.z)
-        else:
-            self.z.copy_from(self.r)
-        self.p.copy_from(self.z)
-
-        # rTz
-        reduce(self.rTz, self.r, self.z)
-        # print("CG iter -1: %.1ef" % self.rTz[None])
-
-        for i in range(self.cg_iter):
-            self.Ap.fill(0.0)
-            self.compute_Ap(self.p)
-
-            # alpha
-            reduce(self.sum, self.p, self.Ap)
-            self.alpha[None] = self.rTz[None] / self.sum[None]
-
-            # update x and r(z)
-            axpy(self.alpha[None], self.p, x)
-            axpy(-self.alpha[None], self.Ap, self.r)
-
-            reduce(self.res, self.r, self.r)
-            # print("CG iter % i: %.1ef" % (i, self.res[None]))
-            if self.res[None] < self.cg_err:
-                if self.b_verbose:
-                    print("[CG converge] iter: %i, err: %.1ef" % (i, self.res[None]))
-                break
-
-            if self.cg_precond == self.CG_PRECOND_METHED["Jacobi"]:
-                element_wist_mul(self.inv_A_diag, self.r, self.z)
-            else:
-                self.z.copy_from(self.r)
-
-            # beta
-            reduce(self.sum, self.r, self.z)
-            self.beta[None] = self.sum[None] / self.rTz[None]
-            self.rTz[None] = self.sum[None]
-
-            scale(self.p, self.beta[None])
-            axpy(1.0, self.z, self.p)
-        else:
-            if self.b_verbose:
-                print("[CG not converge] err: %.1ef" % self.res[None])

@@ -1,14 +1,14 @@
 import os
 import taichi as ti
 import tina
-from threading import Thread
 from time import gmtime, strftime
 
 from ClothModel import ClothModel
+from LinearSolver import LinearSolver
 from ClothSim import ClothSim
 from Optimizer import Optimizer
 
-ti.init(arch=ti.cpu, debug=True, excepthook=True)
+ti.init(arch=ti.gpu, debug=False, excepthook=True)
 
 # display/output params
 b_display = False
@@ -22,32 +22,42 @@ if not b_display:
     output_path = os.path.join("checkpoints", strftime("%Y-%m-%d %H-%M-%S", gmtime()))
     os.makedirs(output_path)
 
+# linear solver params
+cg_precond = "Jacobi"
+cg_iter_ratio = 1.0
+cg_err = 1e-12
+
 # simulation params
-n_frame = 3
-dt = 0.005
-XPBD_iter = 100
+n_frame = 50
+dt = 0.001
+sim_med = "Newton"
+iter = 100 if sim_med == "XPBD" else 5
+err = 1e-6
 use_attach = True
 use_spring = True
 use_stretch = False
 use_bend = False
-k_spring = 1000
-k_attach = 1e5
+k_spring = 1e4
+k_attach = 1e10
 
 # optimization params
-n_epoch = 10
+n_epoch = 20
 desc_rate = 5.0  # start step size
-smoothness = 0.1  # regularization
-cg_precond = "None"
+regl_coef = 0.1
 
 # create scene (allocate memory)
 cloth_model = ClothModel(input_json)
-cloth_sim = ClothSim(cloth_model, dt, XPBD_iter,
+cg_iter = int(cg_iter_ratio * 3 * cloth_model.n_vert)
+linear_solver = LinearSolver(cloth_model.n_vert, cg_precond, cg_iter, cg_err)
+cloth_sim = ClothSim(cloth_model, dt, sim_med, iter, err, linear_solver,
                      use_spring, use_stretch, use_bend, use_attach,
                      k_attach=k_attach, k_spring=k_spring)
-opt = Optimizer(cloth_model, cloth_sim, desc_rate, smoothness, n_frame, cg_precond=cg_precond, b_verbose=b_verbose)
+opt = Optimizer(cloth_model, cloth_sim, linear_solver,
+                desc_rate, regl_coef, n_frame,
+                b_verbose=b_verbose)
 
 if b_display:
-    scene = tina.Scene()  # it allocates memory
+    scene = tina.Scene(res=960)  # it allocates memory
     cloth_model.bind_scene(scene)  # it calls kernel function
 
 # init data
@@ -55,7 +65,7 @@ cloth_sim.initialize()
 opt.initialize()
 
 if b_display:
-    gui = ti.GUI("DiffXPBD")
+    gui = ti.GUI("DiffXPBD", scene.res)
     g_stop = False
 
 
@@ -72,7 +82,7 @@ def display():
             frame_i += 1
             print("[frame %i]" % frame_i)
             opt.tmp_vec.fill(0.0)
-            cloth_sim.XPBD_step(opt.tmp_vec, opt.tmp_vec)
+            cloth_sim.step(opt.tmp_vec, opt.tmp_vec)
             cloth_model.update_scene(opt.tmp_vec.to_numpy())
         scene.input(gui)
         scene.render()
