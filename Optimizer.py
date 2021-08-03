@@ -6,9 +6,15 @@ from FieldUtil import *
 
 @ti.data_oriented
 class Optimizer:
+    OptimizeMethod = {
+        "gradient": 0,
+        "SAP": 1,
+        "Quasi-Newton": 2
+    }
+
     def __init__(self,
-                 cloth_model, cloth_sim, linear_solver,
-                 desc_rate, smoothness, n_frame,
+                 cloth_model, cloth_sim, linear_solver, method, n_frame,
+                 desc_rate, smoothness,
                  ls_alpha=0.5, ls_gamma=0.03,
                  b_verbose=False):
 
@@ -18,6 +24,8 @@ class Optimizer:
 
         self.cloth_model = cloth_model
         self.cloth_sim = cloth_sim
+
+        self.method = self.OptimizeMethod[method]
 
         self.desc_rate = desc_rate
         self.epsilon = smoothness
@@ -30,7 +38,7 @@ class Optimizer:
 
         self.trajectory = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
         self.control_force = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
-        # In face 3 lambda are enough for computing
+        # 3 lambda are enough for computing
         # but if we want to do line-search and have better initial guess for CG, we'd better remember them all
         self.adjoint_vec = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
 
@@ -40,7 +48,7 @@ class Optimizer:
         self.f_loss = 0.0
         self.step_size = 1.0
         self.gradient = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
-        self.tentetive_ctrl_f = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))  # FIXME: can reduce to one Vector.field (w/ more complicate line-search)
+        self.tentetive_ctrl_f = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
 
         self.tmp_vec = ti.Vector.field(3, ti.f32, self.n_vert)  # to access one frame data
         self.sum = ti.field(ti.f32, ())
@@ -147,9 +155,10 @@ class Optimizer:
 
     @ti.kernel
     def __compute_gradient(self):
-        # dLdp = \epsilon * p + h^2 * \lambda
+        # dLdp = \epsilon * p + M / (n_f^2 * h^2) * \lambda
         for I in ti.grouped(self.gradient):
-            self.gradient[I] = self.epsilon * self.control_force[I] + self.dt ** 2 * self.adjoint_vec[I]
+            self.gradient[I] = self.epsilon * self.control_force[I] + \
+                               self.mass / (self.n_frame * self.dt) ** 2 * self.adjoint_vec[I]
 
     def line_search(self):
         """
@@ -187,6 +196,8 @@ class Optimizer:
 
         return self.x_loss < 1e-2
 
+
+
     def backward(self):
         """ Update control forces """
 
@@ -200,12 +211,10 @@ class Optimizer:
             self.cloth_sim.compute_hessian(self.tmp_vec)
 
             # prepare b
-            if i == self.n_frame - 1:  # b_t = M^2 / h^4 / n_f^2 * (q_t - q*)
+            if i == self.n_frame - 1:  # b_t = M * (q_t - q*)
                 self.b.from_numpy(self.cloth_model.target_verts)
                 axpy(-1.0, self.tmp_vec, self.b)
-                scale(self.b, -(self.mass / self.dt ** 2 / self.n_frame) ** 2)
-                # print("last b:")
-                # print_field(self.b)
+                scale(self.b, -self.mass)
             elif i == self.n_frame - 2:  # b_{t-1} = 2 * M * lambda_t
                 self.b.fill(0.0)
                 self.get_frame(self.adjoint_vec, i + 1)

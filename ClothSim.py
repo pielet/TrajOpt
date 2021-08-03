@@ -8,6 +8,7 @@ class ClothSim:
         "XPBD": 0,
         "Newton": 1
     }
+
     def __init__(self,
                  cloth_model, dt, method, n_iter, err, linear_solver,
                  use_spring, use_stretch, use_bend, use_attach,
@@ -155,17 +156,10 @@ class ClothSim:
             n = safe_normalized(x0 - x1)
             C = (x0 - x1).norm() - self.spring_l0[i]
 
-            # XPBD
             dL = -(C + self.spring_alpha * self.spring_lambda[i]) / (2 * self.inv_mass + self.spring_alpha)
             self.spring_lambda[i] += dL
             x[i0] += self.inv_mass * dL * n
             x[i1] += -self.inv_mass * dL * n
-
-            # gradient
-            local_g = self.k_spring * C * n
-            self.gradient[i0] += local_g
-            self.gradient[i1] += -local_g
-
 
     @ti.kernel
     def solve_stretch_con(self, x: ti.template()):
@@ -188,8 +182,6 @@ class ClothSim:
             dL = -(C + self.attach_alpha * self.attach_lambda[i]) / (2 * self.inv_mass + self.attach_alpha)
             self.spring_lambda[i] += dL
             x[idx] += self.inv_mass * dL * n
-
-            self.gradient[idx] += self.k_attach * (xi - xt)
 
     def XPBD(self, ext_f, x_next):
         """
@@ -221,6 +213,7 @@ class ClothSim:
 
         # commit pos and vel
         self.epilogue(x_next)
+
         return n_frame, self.energy[None]
 
     @ti.kernel
