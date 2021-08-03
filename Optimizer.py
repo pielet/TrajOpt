@@ -50,6 +50,7 @@ class Optimizer:
         self.gradient = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
         self.tentetive_ctrl_f = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
 
+        self.target = ti.Vector.field(3, ti.f32, self.n_vert)
         self.tmp_vec = ti.Vector.field(3, ti.f32, self.n_vert)  # to access one frame data
         self.sum = ti.field(ti.f32, ())
 
@@ -63,6 +64,7 @@ class Optimizer:
         self.adjoint_vec.fill(0.0)
         self.gradient.fill(0.0)
         self.tentetive_ctrl_f.fill(0.0)
+        self.target.from_numpy(self.cloth_model.target_verts)
 
     @ti.kernel
     def get_frame(self, vec: ti.template(), fi: ti.i32):
@@ -145,10 +147,9 @@ class Optimizer:
         f_loss = 0.5 * self.epsilon * self.sum[None]
 
         # target position term
-        self.b.from_numpy(self.cloth_model.target_verts)
         self.get_frame(self.trajectory, self.n_frame - 1)
-        axpy(-1.0, self.tmp_vec, self.b)
-        reduce(self.sum, self.b, self.b)
+        axpy(-1.0, self.target, self.tmp_vec)
+        reduce(self.sum, self.tmp_vec, self.tmp_vec)
         x_loss = 0.5 * (self.mass / self.n_frame / self.dt ** 2) ** 2 * self.sum[None]
 
         return x_loss + f_loss, x_loss, f_loss
@@ -163,7 +164,7 @@ class Optimizer:
     def line_search(self):
         """
         Find a proper step size
-        This method will invoke forward simulation several times, so don't need to call forward() explicitly anymore
+        This method will invoke forward simulation several times, so don't need to call forward() anymore
         """
         # compute line search threshold
         if not self.loss:  # first epoch
@@ -194,15 +195,35 @@ class Optimizer:
         self.loss, self.x_loss, self.f_loss = cur_loss, cur_x_loss, cur_f_loss
         self.control_force.copy_from(self.tentetive_ctrl_f)
 
-        return self.x_loss < 1e-2
+        return self.x_loss < 1e-6
 
+    def __compute_constrain(self):
+        """ Compute constrain value: C = 1/2 ||q_{t+1} - q*||_M^2 """
+        self.get_frame(self.trajectory, self.n_frame - 1)
+        axpy(-1.0, self.target, self.tmp_vec)
+        reduce(self.sum, self.tmp_vec, self.tmp_vec)
+        return 0.5 * self.mass * self.sum[None]
 
+    def SAP(self):
+        """
+        Perform one step SAP: p^{k+1} = p^{k} - c(p) / ||\grad C(p)||^2 * \grad c(p)
+        """
+        # update control forces
+        reduce(self.sum, self.adjoint_vec, self.adjoint_vec)
+        dL = self.__compute_constrain() / ((self.dt * self.n_frame) ** 2 * self.sum[None])
+        axpy(-dL, self.adjoint_vec, self.control_force)
+
+        # compute new loss
+        self.__forward(self.control_force)
+        self.loss, self.x_loss, self.f_loss = self.__compute_loss(self.control_force)
+
+        return self.x_loss < 1e-6
 
     def backward(self):
         """ Update control forces """
 
         # compute lambda
-        print("[start backward]", end=" ")
+        print("[compute lambda]", end=" ")
 
         iter, err = 0, 0
         for i in range(self.n_frame - 1, -1, -1):
@@ -212,9 +233,9 @@ class Optimizer:
 
             # prepare b
             if i == self.n_frame - 1:  # b_t = M * (q_t - q*)
-                self.b.from_numpy(self.cloth_model.target_verts)
-                axpy(-1.0, self.tmp_vec, self.b)
-                scale(self.b, -self.mass)
+                self.b.copy_from(self.tmp_vec)
+                axpy(-1.0, self.target, self.b)
+                scale(self.b, self.mass)
             elif i == self.n_frame - 2:  # b_{t-1} = 2 * M * lambda_t
                 self.b.fill(0.0)
                 self.get_frame(self.adjoint_vec, i + 1)
@@ -235,8 +256,12 @@ class Optimizer:
 
         print("CG avg.iter: %d, avg.err: %.1ef" % (iter / self.n_frame, err / self.n_frame))
 
-        # update control forces (gradient descent with line search)
-        print("[start line-search]")
-        b_converge = self.line_search()
+        # update control forces
+        if self.method == self.OptimizeMethod["gradient"]:
+            print("[start line-search]")
+            b_converge = self.line_search()
+        elif self.method == self.OptimizeMethod["SAP"]:
+            print("[start SAP]")
+            b_converge = self.SAP()
 
         return b_converge

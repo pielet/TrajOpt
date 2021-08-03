@@ -41,8 +41,8 @@ k_spring = 1e3
 k_attach = 1e10
 
 # optimization params
-op_med = "gradient"
-n_epoch = 10
+op_med = "SAP"
+n_epoch = 50
 desc_rate = 1.0  # start step size
 regl_coef = 0.1
 
@@ -104,7 +104,7 @@ def optimize():
         os.makedirs(epoch_dir)
 
         b_converge = opt.backward()
-        print("[epoch %i] loss: %.1f (%.1f / %.1f)" % (i, opt.loss, opt.x_loss, opt.f_loss))
+        print("[epoch %i] loss: %.1f (%.1ef / %.1f)" % (i, opt.loss, opt.x_loss, opt.f_loss))
 
         if b_save_trajectory:
             opt.save_trajectory(epoch_dir)
