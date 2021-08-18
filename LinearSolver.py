@@ -87,6 +87,10 @@ class LinearSolver:
         reduce(self.rTz, self.r, self.z)
         # print("CG iter -1: %.1ef" % self.rTz[None])
 
+        reduce(self.res, self.r, self.r)
+        if self.res[None] < threshold:
+            return 0, self.res[None]
+
         n_iter = 0
         for i in range(self.cg_iter):
             n_iter += 1

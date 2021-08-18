@@ -207,7 +207,7 @@ class ClothSim:
 
             self.compute_gradient(x_next)
             reduce(self.energy, self.gradient, self.gradient)
-            self.energy[None] /= self.n_vert
+            self.energy[None] = ti.sqrt(self.energy[None]) / self.n_vert
             if self.energy[None] < self.err:
                 break
 
@@ -365,24 +365,30 @@ class ClothSim:
         self.prologue(ext_f, x_next)
 
         n_frame = 0
+        residual = 0.0
         for i in range(self.n_iter):
-            n_frame += 1
             self.compute_gradient(x_next)
             self.compute_hessian(x_next)
 
-            self.linear_solver.conjugate_gradient(self.desc_dir)
+            reduce(self.energy, self.gradient, self.gradient)
+            residual = ti.sqrt(self.energy[None]) / self.n_vert
+            if residual < self.err: break
+
+            (it, err) = self.linear_solver.conjugate_gradient(self.desc_dir)
+            print(f"  CG iter {it} err {err}")
             scale(self.desc_dir, -1.0)
 
             step_size = self.line_search(x_next, self.desc_dir, self.gradient)
-            reduce(self.energy, self.gradient, self.gradient)
-            self.energy[None] /= self.n_vert
-            if step_size < 1e-5 or self.energy[None] < self.err:
+            if step_size < 1e-5:
                 break
             axpy(step_size, self.desc_dir, x_next)
 
+            n_frame += 1
+
         self.epilogue(x_next)
 
-        return n_frame, self.energy[None]
+        print(n_frame, residual)
+        return n_frame, residual
 
     def step(self, ext_f, x_next):
         if self.method == self.SimulationMethod["XPBD"]:

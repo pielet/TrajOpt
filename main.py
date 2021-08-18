@@ -28,11 +28,11 @@ cg_iter_ratio = 1.0
 cg_err = 1e-12
 
 # simulation params
-n_frame = 50
+n_frame = 100
 dt = 0.005
 sim_med = "Newton"
 iter = 500 if sim_med == "XPBD" else 5
-err = 1e-6
+sim_err = 1e-6
 use_attach = True
 use_spring = True
 use_stretch = False
@@ -41,10 +41,10 @@ k_spring = 1e3
 k_attach = 1e10
 
 # optimization params
-op_med = "SAP"
+opt_med = "gradient"
 n_epoch = 50
-desc_rate = 1.0  # start step size
-regl_coef = 0.1
+desc_rate = 0.01  # start step size
+regl_coef = 10.0
 
 # create scene (allocate memory)
 cloth_model = ClothModel(input_json)
@@ -52,11 +52,11 @@ cloth_model = ClothModel(input_json)
 cg_iter = int(cg_iter_ratio * 3 * cloth_model.n_vert)
 linear_solver = LinearSolver(cloth_model.n_vert, cg_precond, cg_iter, cg_err)
 
-cloth_sim = ClothSim(cloth_model, dt, sim_med, iter, err, linear_solver,
+cloth_sim = ClothSim(cloth_model, dt, sim_med, iter, sim_err, linear_solver,
                      use_spring, use_stretch, use_bend, use_attach,
                      k_attach=k_attach, k_spring=k_spring)
 
-opt = Optimizer(cloth_model, cloth_sim, linear_solver, op_med, n_frame,
+opt = Optimizer(cloth_model, cloth_sim, linear_solver, opt_med, n_frame,
                 desc_rate, regl_coef,
                 b_verbose=b_verbose)
 
@@ -70,24 +70,23 @@ opt.initialize()
 
 if b_display:
     gui = ti.GUI("DiffXPBD", scene.res)
-    g_stop = False
 
 
 def display():
-    global g_stop
+    b_stop = False
     frame_i = 0
     while gui.running:
         if gui.get_event():
             if gui.event.key == gui.ESCAPE:
                 break
             elif gui.event.key == gui.SPACE and gui.event.type == gui.PRESS:
-                g_stop = ~g_stop
-        if not g_stop:
+                b_stop = ~b_stop
+        if not b_stop:
             frame_i += 1
             print(f"[frame {frame_i}]")
             opt.tmp_vec.fill(0.0)
             iter, err = cloth_sim.step(opt.tmp_vec, opt.tmp_vec)
-            print("%d, %.1ef" % (iter, err))
+            print("%d, %.1e" % (iter, err))
             cloth_model.update_scene(opt.tmp_vec.to_numpy())
         scene.input(gui)
         scene.render()
@@ -96,15 +95,20 @@ def display():
 
 
 def optimize():
-    opt.forward()
-    for i in range(n_epoch):
+    b_converge = False
+    for i in range(n_epoch + 1):
         print(f"====================== epoch {i} =====================")
 
-        epoch_dir = os.path.join(output_path, "epoch_%i" % i)
+        epoch_dir = os.path.join(output_path, f"epoch_{i}")
         os.makedirs(epoch_dir)
 
-        b_converge = opt.backward()
-        print("[epoch %i] loss: %.1f (%.1ef / %.1f)" % (i, opt.loss, opt.x_loss, opt.f_loss))
+        if i == 0:
+            opt.forward()
+            opt.compute_loss()
+        else:
+            b_converge = opt.backward()
+
+        print(f"[epoch {i}] loss: {opt.loss} ({opt.x_loss} / {opt.f_loss})")
 
         if b_save_trajectory:
             opt.save_trajectory(epoch_dir)

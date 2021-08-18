@@ -43,7 +43,7 @@ class Optimizer:
         self.adjoint_vec = ti.Vector.field(3, ti.f32, (n_frame, self.n_vert))
 
         # line-search
-        self.loss = None
+        self.loss = 0.0
         self.x_loss = 0.0
         self.f_loss = 0.0
         self.step_size = 1.0
@@ -125,13 +125,14 @@ class Optimizer:
 
         frame, err = 0, 0
         for i in range(self.n_frame):
+            print(f"frame {i}")
             self.get_frame(control_force, i)
             fi, ei = self.cloth_sim.step(self.tmp_vec, self.tmp_vec)  # FIXME: assume ext_f and x_next can be the same vector
             frame += fi
             err += ei
             self.set_frame(self.trajectory, i)
 
-        print("avg.iter: %i, avg.err: %.1ef" % (frame / self.n_frame, err / self.n_frame))
+        print("avg.iter: %i, avg.err: %.1e" % (frame / self.n_frame, err / self.n_frame))
 
     def forward(self):
         """ Run frames of simulation """
@@ -154,6 +155,10 @@ class Optimizer:
 
         return x_loss + f_loss, x_loss, f_loss
 
+    def compute_loss(self):
+        """ Compute init loss """
+        self.loss, self.x_loss, self.f_loss = self.__compute_loss(self.control_force)
+
     @ti.kernel
     def __compute_gradient(self):
         # dLdp = \epsilon * p + M / (n_f^2 * h^2) * \lambda
@@ -167,9 +172,6 @@ class Optimizer:
         This method will invoke forward simulation several times, so don't need to call forward() anymore
         """
         # compute line search threshold
-        if not self.loss:  # first epoch
-            self.loss, self.x_loss, self.f_loss = self.__compute_loss(self.control_force)
-            print("[init loss] %f (%f / %f)" % (self.loss, self.x_loss, self.f_loss))
         self.__compute_gradient()
         reduce(self.sum, self.gradient, self.gradient)
         threshold = self.ls_gamma * self.desc_rate * self.sum[None]
@@ -184,7 +186,7 @@ class Optimizer:
             self.__forward(self.tentetive_ctrl_f)
             cur_loss, cur_x_loss, cur_f_loss = self.__compute_loss(self.tentetive_ctrl_f)
 
-            print("step size: %f  loss: %.1f (%.1f / %.1f)" % (step_size, cur_loss, cur_x_loss, cur_f_loss))
+            print("step size: %f  loss: %.1f (%.1f / %.1f)  threshold: %.1f" % (step_size, cur_loss, cur_x_loss, cur_f_loss, self.loss + step_size * threshold))
 
             if cur_loss < self.loss + step_size * threshold or step_size < 1e-5:
                 break
@@ -207,10 +209,12 @@ class Optimizer:
     def SAP(self):
         """
         Perform one step SAP: p^{k+1} = p^{k} - c(p) / ||\grad C(p)||^2 * \grad c(p)
+        \grad c(p) = -h^2 * \lambda
         """
         # update control forces
+        cons = self.__compute_constrain()
         reduce(self.sum, self.adjoint_vec, self.adjoint_vec)
-        dL = self.__compute_constrain() / ((self.dt * self.n_frame) ** 2 * self.sum[None])
+        dL = cons / (self.dt ** 2 * self.sum[None])
         axpy(-dL, self.adjoint_vec, self.control_force)
 
         # compute new loss
@@ -254,7 +258,7 @@ class Optimizer:
             iter += iter_i
             err += err_i
 
-        print("CG avg.iter: %d, avg.err: %.1ef" % (iter / self.n_frame, err / self.n_frame))
+        print("CG avg.iter: %d, avg.err: %.1e" % (iter / self.n_frame, err / self.n_frame))
 
         # update control forces
         if self.method == self.OptimizeMethod["gradient"]:
