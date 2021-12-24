@@ -2,20 +2,28 @@ import os
 import json
 import numpy as np
 import taichi as ti
-import tina
 
+def load_obj(file_name):
+    verts = []
+    faces = []
+    with open(file_name) as f:
+        for line in f:
+            if line.startswith('v'):
+                verts.append([float(x) for x in line.split()[1:]])
+            elif line.startswith('f'):
+                faces.append([int(x) - 1 for x in line.split()[1:]])
+    return np.array(verts), np.array(faces)
 
 class ClothModel:
     def __init__(self, input_json):
         with open(input_json, 'r') as f:
             input = json.load(f)
 
-        self.verts, self.faces = tina.readobj(input["init"], simple=True)
-        self.target_verts, _ = tina.readobj(input["target"], simple=True)  # assume target and initial model have the same topology
+        self.verts, self.faces = load_obj(input["init"])
+        self.target_verts, _ = load_obj(input['target'])
         self.fixed_idx = np.array(input["fixed"])
-
-        self.mesh_model = tina.ConnectiveMesh()
-        self.wire_model = tina.MeshToWire(self.mesh_model)
+        self.init_traj = np.load(input['init_traj'])
+        self.init_force = np.load(input['force'])
 
         self.n_vert = self.verts.shape[0]
         self.n_face = self.faces.shape[0]
@@ -46,12 +54,8 @@ class ClothModel:
         self.n_inner_edge = len(inner_edge_list)
         self.inner_edges = np.array(inner_edge_list)
 
-    def bind_scene(self, scene):
-        scene.add_object(self.mesh_model, tina.Classic())
-        scene.add_object(self.wire_model)
-        self.mesh_model.set_vertices(self.verts)
-        self.mesh_model.set_faces(self.faces)
+        self.face_field = ti.field(ti.i32, 3 * self.n_face)
 
-    def update_scene(self, verts):
-        self.mesh_model.set_vertices(verts)
+    def initialize(self):
+        self.face_field.from_numpy(self.faces.flatten())
 

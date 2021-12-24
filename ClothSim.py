@@ -6,14 +6,16 @@ from FieldUtil import *
 class ClothSim:
     SimulationMethod = {
         "XPBD": 0,
-        "Newton": 1
+        "implicit": 1,
+        "symplectic": 2
     }
 
     def __init__(self,
                  cloth_model, dt, method, n_iter, err, linear_solver,
                  use_spring, use_stretch, use_bend, use_attach,
                  k_spring=0.0, k_stretch=0.0, k_bend=0.0, k_attach=0.0,
-                 density=1.5):  # g/cm^2
+                 density=1.5, # g/cm^2
+                 b_verbose=False):
         self.cloth_model = cloth_model
         self.n_vert = cloth_model.n_vert
         self.n_face = cloth_model.n_face
@@ -23,6 +25,8 @@ class ClothSim:
         self.err = err
         self.density = density
         self.gravity = ti.Vector([0.0, -9.8, 0.0])
+
+        self.b_verbose = b_verbose
 
         self.x = ti.Vector.field(3, ti.f32, self.n_vert)
         self.v = ti.Vector.field(3, ti.f32, self.n_vert)
@@ -75,12 +79,14 @@ class ClothSim:
         ## linear solver
         self.linear_solver = linear_solver
         self.hessian = linear_solver.A
+        self.hessian_pointer = linear_solver.A_pointer
         self.gradient = linear_solver.b
         self.desc_dir = ti.Vector.field(3, ti.f32, self.n_vert)
         ## line-search
         self.tentetive_x = ti.Vector.field(3, ti.f32, self.n_vert)
         self.energy = ti.field(ti.f32, ())
 
+        self.sparsity = 0
 
     @ti.kernel
     def compute_total_area(self):
@@ -134,6 +140,9 @@ class ClothSim:
         if self.use_attach:
             self.attach_idx.from_numpy(self.cloth_model.fixed_idx)
             self.init_attach_con()
+
+        self.compute_hessian(self.x)
+        self.sparsity = sparsity(self.hessian, self.hessian_pointer)
 
     @ti.kernel
     def prologue(self, ext_f: ti.template(), x_next: ti.template()):
@@ -197,9 +206,9 @@ class ClothSim:
         if self.use_bend: self.bend_lambda.fill(0.0)
         if self.use_attach: self.attach_lambda.fill(0.0)
 
-        n_frame = 0
+        n_iter = 0
         for i in range(self.n_iter):
-            n_frame += 1
+            n_iter += 1
             if self.use_spring: self.solve_spring_con(x_next)
             if self.use_stretch: self.solve_stretch_con(x_next)
             if self.use_bend: self.solve_bend_con(x_next)
@@ -214,7 +223,7 @@ class ClothSim:
         # commit pos and vel
         self.epilogue(x_next)
 
-        return n_frame, self.energy[None]
+        return n_iter, self.energy[None]
 
     @ti.kernel
     def compute_spring_energy(self, x: ti.template()):
@@ -239,17 +248,17 @@ class ClothSim:
             self.energy[None] += 0.5 * self.k_attach * (xi - xt).norm_sqr()
 
     def compute_energy(self, x):
-        """ Compute objective of [x: ti.Vector.field]: 1/2 * ||x - y||_M^2 + h^2 * E(x) """
+        """ Compute objective of [x: ti.Vector.field]: 1/2 * M/h^2 * ||x - y||^2 + E(x) """
         if self.use_spring: self.compute_spring_energy(x)
         if self.use_stretch: self.compute_stretch_energy(x)
         if self.use_bend: self.compute_bend_energy(x)
         if self.use_attach: self.compute_attach_energy(x)
-        inner_energy = self.dt ** 2 * self.energy[None]
+        inner_energy = self.energy[None]
 
         self.tentetive_x.copy_from(x)  # FIXME: assume self.tentative_x is unused
         axpy(-1.0, self.y, self.tentetive_x)
         reduce(self.energy, self.tentetive_x, self.tentetive_x)
-        inertia_energy = 0.5 * self.mass * self.energy[None]
+        inertia_energy = 0.5 * self.mass / (self.dt * self.dt) * self.energy[None]
 
         return inner_energy + inertia_energy
 
@@ -280,8 +289,8 @@ class ClothSim:
             xt = self.attach_target[i]
             self.gradient[idx] += self.k_attach * (xi - xt)
 
-    def compute_gradient(self, x):
-        """ Compute gradient of [x: ti.Vector.field]: M * (x - y) + h^2 \grad E(x) """
+    def compute_gradient(self, x, b_full=True):
+        """ Compute gradient of [x: ti.Vector.field]: M/h^2 * (x - y) + \grad E(x) """
         self.gradient.fill(0.0)
 
         if self.use_spring: self.compute_spring_gradient(x)
@@ -289,9 +298,10 @@ class ClothSim:
         if self.use_bend: self.compute_bend_gradient(x)
         if self.use_attach: self.compute_attach_gradient(x)
 
-        scale(self.gradient, self.dt ** 2)
-        axpy(self.mass, x, self.gradient)
-        axpy(-self.mass, self.y, self.gradient)
+        if b_full:
+            scalar = self.mass / (self.dt * self.dt)
+            axpy(scalar, x, self.gradient)
+            axpy(-scalar, self.y, self.gradient)
 
     @ti.kernel
     def compute_spring_hessian(self, x: ti.template()):
@@ -333,8 +343,8 @@ class ClothSim:
         for i in range(self.n_vert):
             self.hessian[i, i] += a * ti.Matrix.identity(ti.f32, 3)
 
-    def compute_hessian(self, x):
-        """ Compute Hessian matrix of [x: ti.Vector.field]: M + h^2 \grad^2 E(x) """
+    def compute_hessian(self, x, b_full=True):
+        """ Compute Hessian matrix of [x: ti.Vector.field]: M/h^2 + \grad^2 E(x) """
         self.linear_solver.reset()
 
         if self.use_spring: self.compute_spring_hessian(x)
@@ -342,8 +352,8 @@ class ClothSim:
         if self.use_bend: self.compute_bend_hessian(x)
         if self.use_attach: self.compute_attach_hessian(x)
 
-        scale(self.hessian, self.dt ** 2)
-        self.add_in_diagonal(self.mass)
+        if b_full:
+            self.add_in_diagonal(self.mass / (self.dt * self.dt))
 
     def line_search(self, x, desc_dir, gradient):
         obj = self.compute_energy(x)
@@ -361,21 +371,34 @@ class ClothSim:
 
         return step_size
 
-    def Newton(self, ext_f, x_next):
+    def implicit(self, ext_f, x_next):
         self.prologue(ext_f, x_next)
 
-        n_frame = 0
+        # newton's method
+        n_iter = 0
         residual = 0.0
         for i in range(self.n_iter):
-            self.compute_gradient(x_next)
-            self.compute_hessian(x_next)
+            self.compute_gradient(x_next, True)
+            self.compute_hessian(x_next, True)
 
             reduce(self.energy, self.gradient, self.gradient)
-            residual = ti.sqrt(self.energy[None]) / self.n_vert
-            if residual < self.err: break
+            residual = ti.sqrt(self.energy[None])
+            if i == 0:
+                init_residual = residual
+            if residual < self.err * init_residual:
+                break
 
-            (it, err) = self.linear_solver.conjugate_gradient(self.desc_dir)
-            print(f"  CG iter {it} err {err}")
+            # (it, err) = self.linear_solver.conjugate_gradient(self.desc_dir)
+            # if self.b_verbose: print(f"  CG iter {it} err {err}")
+            A_builder = ti.linalg.sparse_matrix_builder(3 * self.n_vert, 3 * self.n_vert, max_num_triplets=self.sparsity)
+            field_to_sparse(self.hessian, A_builder)
+            A = A_builder.build()
+            solver = ti.linalg.SparseSolver(solver_type="LLT")
+            solver.analyze_pattern(A)
+            solver.factorize(A)
+            dx = solver.solve(self.gradient.to_numpy().flatten())
+            self.desc_dir.from_numpy(dx.reshape([-1, 3]))
+
             scale(self.desc_dir, -1.0)
 
             step_size = self.line_search(x_next, self.desc_dir, self.gradient)
@@ -383,15 +406,32 @@ class ClothSim:
                 break
             axpy(step_size, self.desc_dir, x_next)
 
-            n_frame += 1
+            n_iter += 1
 
         self.epilogue(x_next)
 
-        print(n_frame, residual)
-        return n_frame, residual
+        if self.b_verbose: print(f"  Newton iter {n_iter}, res {residual}")
+        return n_iter, residual
 
-    def step(self, ext_f, x_next):
+    def symplectic(self, f_ext, x_next):
+        self.compute_gradient(self.x, False)
+
+        @ti.kernel
+        def update(f_ext: ti.template()):
+            for i in range(self.n_vert):
+                self.v[i] += self.dt * (self.inv_mass * (f_ext[i] - self.gradient[i]) + self.gravity)
+                self.x[i] += self.dt * self.v[i]
+
+        update(f_ext)
+        x_next.copy_from(self.x)
+
+        return 0, 0
+
+    def step(self, f_ext, x_next):
         if self.method == self.SimulationMethod["XPBD"]:
-            return self.XPBD(ext_f, x_next)
-        elif self.method == self.SimulationMethod["Newton"]:
-            return self.Newton(ext_f, x_next)
+            return self.XPBD(f_ext, x_next)
+        elif self.method == self.SimulationMethod["implicit"]:
+            return self.implicit(f_ext, x_next)
+        elif self.method == self.SimulationMethod["symplectic"]:
+            return self.symplectic(f_ext, x_next)
+

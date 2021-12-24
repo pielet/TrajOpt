@@ -1,85 +1,110 @@
 import os
+import time
+
+import numpy as np
 import taichi as ti
-import tina
-from time import gmtime, strftime
+from time import localtime, strftime
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 from ClothModel import ClothModel
 from LinearSolver import LinearSolver
 from ClothSim import ClothSim
 from Optimizer import Optimizer
 
-ti.init(arch=ti.cpu, debug=False, excepthook=True)
+ti.init(arch=ti.cpu, debug=False)
 
 # display/output params
 b_display = False
-b_save_frame = True
-b_save_trajectory = True
+b_save_every_epoch = False
+b_save_npy = True
 b_verbose = False
 
 # input/output path
 input_json = "assets/input.json"
 if not b_display:
-    output_path = os.path.join("checkpoints", strftime("%Y-%m-%d %H-%M-%S", gmtime()))
+    output_path = os.path.join("checkpoints", strftime("%Y-%m-%d %H-%M-%S", localtime()))
     os.makedirs(output_path)
 
-# linear solver params
-cg_precond = "Jacobi"
-cg_iter_ratio = 1.0
-cg_err = 1e-12
+# implicit Euler linear solver params
+ie_solver = "direct"  # direct, cg
+ie_cg_precond = "Jacobi"
+ie_cg_iter_ratio = 1.0
+ie_cg_err = 1e-12
 
 # simulation params
-n_frame = 100
-dt = 0.005
-sim_med = "Newton"
-iter = 500 if sim_med == "XPBD" else 5
-sim_err = 1e-6
+n_frame = 80
+dt = 0.01
+sim_med = "implicit"  # implicit, symplectic, XPBD
+iter = 500 if sim_med == "XPBD" else 5  # only for implicit Euler / XPBD
+sim_err = 1e-6  # only for implicit Euler / XPBD
 use_attach = True
 use_spring = True
 use_stretch = False
 use_bend = False
-k_spring = 1e3
-k_attach = 1e10
+k_spring = 500
+k_attach = 1e5
 
 # optimization params
-opt_med = "gradient"
-n_epoch = 50
+opt_med = "Gauss-Newton"  # gradient, projected Newton, SAP, Gauss-Newton
+n_epoch = 1
+## force based opt params
+opt_sim_med = "implicit"  # implicit, symplectic
 desc_rate = 0.01  # start step size
 regl_coef = 10.0
+## position based opt params
+init_med = "load"  # static, solve, load
+### Gauss-Newton linear solver params
+b_matrix_free = False
+gn_integration = "implicit"  # implicit, symplectic
+gn_solver = "direct"  # direct, cg
+gn_cg_precond = "None"
+gn_cg_iter_ratio = 1.0
+gn_cg_err = 1e-12
 
 # create scene (allocate memory)
 cloth_model = ClothModel(input_json)
 
-cg_iter = int(cg_iter_ratio * 3 * cloth_model.n_vert)
-linear_solver = LinearSolver(cloth_model.n_vert, cg_precond, cg_iter, cg_err)
+ie_cg_iter = int(ie_cg_iter_ratio * 3 * cloth_model.n_vert)
+ie_linear_solver = LinearSolver(cloth_model.n_vert, ie_cg_precond, ie_cg_iter, ie_cg_err)
 
-cloth_sim = ClothSim(cloth_model, dt, sim_med, iter, sim_err, linear_solver,
+cloth_sim = ClothSim(cloth_model, dt, sim_med, iter, sim_err, ie_linear_solver,
                      use_spring, use_stretch, use_bend, use_attach,
-                     k_attach=k_attach, k_spring=k_spring)
+                     k_attach=k_attach, k_spring=k_spring, b_verbose=b_verbose)
 
-opt = Optimizer(cloth_model, cloth_sim, linear_solver, opt_med, n_frame,
-                desc_rate, regl_coef,
+opt = Optimizer(cloth_model, cloth_sim, ie_linear_solver, opt_med, n_frame,
+                opt_sim_med, desc_rate, regl_coef,
+                init_med, gn_integration, gn_solver, b_matrix_free, gn_cg_precond, gn_cg_iter_ratio, gn_cg_err,
                 b_verbose=b_verbose)
 
-if b_display:
-    scene = tina.Scene(res=960)  # it allocates memory
-    cloth_model.bind_scene(scene)  # it calls kernel function
-
 # init data
+cloth_model.initialize()
 cloth_sim.initialize()
 opt.initialize()
 
 if b_display:
-    gui = ti.GUI("DiffXPBD", scene.res)
+    window = ti.ui.Window("Loopy cloth", (640, 640))
+    canvas = window.get_canvas()
+    scene = ti.ui.Scene()
 
+    camera = ti.ui.make_camera()
+    camera.position(-1.8, 0.5, 0.4)
+    camera.lookat(0.0, 0.0, 0.0)
+
+    scene.mesh(cloth_sim.x, cloth_model.face_field, two_sided=True)
+    scene.set_camera(camera)
+    scene.point_light((0, 0.5, 0), (1, 1, 1))
+    canvas.scene(scene)
+    window.show()
 
 def display():
     b_stop = False
     frame_i = 0
-    while gui.running:
-        if gui.get_event():
-            if gui.event.key == gui.ESCAPE:
+    while window.running:
+        if window.get_event(ti.ui.PRESS):
+            if window.event.key == ti.ui.ESCAPE:
                 break
-            elif gui.event.key == gui.SPACE and gui.event.type == gui.PRESS:
+            elif window.event.key == ti.ui.SPACE:
                 b_stop = ~b_stop
         if not b_stop:
             frame_i += 1
@@ -87,36 +112,89 @@ def display():
             opt.tmp_vec.fill(0.0)
             iter, err = cloth_sim.step(opt.tmp_vec, opt.tmp_vec)
             print("%d, %.1e" % (iter, err))
-            cloth_model.update_scene(opt.tmp_vec.to_numpy())
-        scene.input(gui)
-        scene.render()
-        gui.set_image(scene.img)
-        gui.show()
+
+        scene.mesh(opt.tmp_vec, cloth_model.face_field, two_sided=True)
+        scene.set_camera(camera)
+        scene.point_light((0, 0.5, 0), (1, 1, 1))
+        canvas.scene(scene)
+        window.show()
+
+        time.sleep(dt * 2)
 
 
 def optimize():
-    b_converge = False
     for i in range(n_epoch + 1):
         print(f"====================== epoch {i} =====================")
 
-        epoch_dir = os.path.join(output_path, f"epoch_{i}")
-        os.makedirs(epoch_dir)
-
         if i == 0:
-            opt.forward()
-            opt.compute_loss()
+            opt.compute_init_loss()
+            if opt_med == "Gauss-Newton":
+                print(f"[init] loss: {opt.loss}")
+            else:
+                print(f"[init] loss: {opt.loss} (force: {opt.force_loss / regl_coef} / constrain: {opt.constrain_loss / (cloth_sim.mass / n_frame / dt ** 2) ** 2})")
         else:
-            b_converge = opt.backward()
+            b_converge = opt.one_iter()
+            if opt_med == "Gauss-Newton":
+                print(f"[epoch {i}] loss: {opt.loss}")
+            else:
+                print(f"[epoch {i}] loss: {opt.loss} (force: {opt.force_loss / regl_coef} / constrain: {opt.constrain_loss / (cloth_sim.mass / n_frame / dt ** 2) ** 2})")
 
-        print(f"[epoch {i}] loss: {opt.loss} ({opt.x_loss} / {opt.f_loss})")
+        if b_save_every_epoch or i == 0 or i == n_epoch:
+            epoch_dir = os.path.join(output_path, f"epoch_{i}")
+            os.makedirs(epoch_dir)
 
-        if b_save_trajectory:
-            opt.save_trajectory(epoch_dir)
-        if b_save_frame:
+            if opt_med == "Gauss-Newton":
+                opt.compute_virtual_force()
+
+            opt.save_trajectory(epoch_dir, b_save_npy)
             opt.save_frame(epoch_dir)
 
-        if b_converge:
-            break
+    visualize()
+
+def visualize():
+    loss = np.array(opt.loss_list)
+    loss_per_frame = np.roll(np.array(opt.loss_per_frame), 2, axis=1)
+
+    fig, ax1 = plt.subplots()
+
+    if opt_med == "Gauss-Newton":
+        color = 'tab:blue'
+        ax1.set_xlabel('iter')
+        ax1.set_ylabel('loss', color=color)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.plot(loss)
+    else:
+        color = 'tab:blue'
+        ax1.set_xlabel('iter')
+        ax1.set_ylabel('loss', color=color)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.plot(loss[:, 1] / regl_coef, color=color)
+
+        ax2 = ax1.twinx()
+
+        color = 'orange'
+        ax2.set_ylabel('constrain', color=color)  # we already handled the x-label with ax1
+        ax2.tick_params(axis='y', labelcolor=color)
+        ax2.plot(loss[:, 2] / (cloth_sim.mass / n_frame / dt ** 2) ** 2, color=color)
+
+        fig.tight_layout()
+
+    plt.savefig(os.path.join(output_path, "loss.png"))
+    plt.close()
+
+    fig, axis = plt.subplots(1, 1)
+    axis.set_xlim(0, n_frame)
+    # axis.set_ylim(0, loss_per_frame.max())
+    data = axis.plot(np.arange(n_frame))[0]
+
+    def update(i):
+        data.set_ydata(loss_per_frame[i])
+        axis.set_title(f"epoch_{i}")
+        axis.set_ylim(loss_per_frame[i].min(), loss_per_frame[i].max())
+
+    total_time = 5
+    loss_ani = FuncAnimation(fig, update, frames=(n_epoch+1), interval=(total_time * 1000 / n_epoch))
+    loss_ani.save(os.path.join(output_path, "loss_per_frame.gif"))
 
 
 if __name__ == "__main__":
