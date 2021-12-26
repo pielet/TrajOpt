@@ -16,7 +16,7 @@ ti.init(arch=ti.cpu, debug=False)
 
 # display/output params
 b_display = False
-b_save_every_epoch = False
+b_save_every_epoch = True
 b_save_npy = True
 b_verbose = False
 
@@ -46,14 +46,15 @@ k_spring = 500
 k_attach = 1e5
 
 # optimization params
-opt_med = "Gauss-Newton"  # gradient, projected Newton, SAP, Gauss-Newton
-n_epoch = 1
+opt_med = "projected Newton"  # gradient, projected Newton, SAP, Gauss-Newton
+n_epoch = 200
 ## force based opt params
 opt_sim_med = "implicit"  # implicit, symplectic
-desc_rate = 0.01  # start step size
-regl_coef = 10.0
+desc_rate = 0.01  # start step sizegit
+regl_coef = 0.01
 ## position based opt params
-init_med = "load"  # static, solve, load
+b_soft_con = False if opt_med == "SAP" or opt_med == "projected Newton" else True
+init_med = "fix"  # static, solve (0 physical loss), fix (0 constrain loss), load (mixed loss)
 ### Gauss-Newton linear solver params
 b_matrix_free = False
 gn_integration = "implicit"  # implicit, symplectic
@@ -74,7 +75,7 @@ cloth_sim = ClothSim(cloth_model, dt, sim_med, iter, sim_err, ie_linear_solver,
 
 opt = Optimizer(cloth_model, cloth_sim, ie_linear_solver, opt_med, n_frame,
                 opt_sim_med, desc_rate, regl_coef,
-                init_med, gn_integration, gn_solver, b_matrix_free, gn_cg_precond, gn_cg_iter_ratio, gn_cg_err,
+                init_med, b_soft_con, gn_integration, gn_solver, b_matrix_free, gn_cg_precond, gn_cg_iter_ratio, gn_cg_err,
                 b_verbose=b_verbose)
 
 # init data
@@ -126,18 +127,28 @@ def optimize():
     for i in range(n_epoch + 1):
         print(f"====================== epoch {i} =====================")
 
+        c = (cloth_sim.mass / n_frame / dt ** 2) ** 2 / regl_coef
+
         if i == 0:
             opt.compute_init_loss()
             if opt_med == "Gauss-Newton":
-                print(f"[init] loss: {opt.loss}")
+                if not b_soft_con:
+                    print(f"[init] loss: {opt.loss}")
+                else:
+                    print(f"[init] loss: {opt.loss} (loopy: {opt.loopy_loss} / constrain: {opt.constrain_loss / c} / scaled_constrain: {opt.constrain_loss})")
             else:
-                print(f"[init] loss: {opt.loss} (force: {opt.force_loss / regl_coef} / constrain: {opt.constrain_loss / (cloth_sim.mass / n_frame / dt ** 2) ** 2})")
+                print(f"[init] loss: {opt.loss} (force: {opt.force_loss} / constrain: {opt.constrain_loss})")
         else:
             b_converge = opt.one_iter()
             if opt_med == "Gauss-Newton":
-                print(f"[epoch {i}] loss: {opt.loss}")
-            else:
+                if not b_soft_con:
+                    print(f"[epoch {i}] loss: {opt.loss}")
+                else:
+                    print(f"[init] loss: {opt.loss} (loopy: {opt.loopy_loss} / constrain: {opt.constrain_loss / c} / scaled_constrain: {opt.constrain_loss})")
+            elif opt_med == "gradient":
                 print(f"[epoch {i}] loss: {opt.loss} (force: {opt.force_loss / regl_coef} / constrain: {opt.constrain_loss / (cloth_sim.mass / n_frame / dt ** 2) ** 2})")
+            else:
+                print(f"[epoch {i}] loss: {opt.loss} (force: {opt.force_loss} / constrain: {opt.constrain_loss} / lambda: {opt.L} / loopy_loss: {opt.loopy_loss})")
 
         if b_save_every_epoch or i == 0 or i == n_epoch:
             epoch_dir = os.path.join(output_path, f"epoch_{i}")
@@ -157,25 +168,25 @@ def visualize():
 
     fig, ax1 = plt.subplots()
 
-    if opt_med == "Gauss-Newton":
+    if opt_med == "Gauss-Newton" and not b_soft_con:
         color = 'tab:blue'
         ax1.set_xlabel('iter')
         ax1.set_ylabel('loss', color=color)
         ax1.tick_params(axis='y', labelcolor=color)
-        ax1.plot(loss)
+        ax1.plot(loss[:, 0])
     else:
         color = 'tab:blue'
         ax1.set_xlabel('iter')
         ax1.set_ylabel('loss', color=color)
         ax1.tick_params(axis='y', labelcolor=color)
-        ax1.plot(loss[:, 1] / regl_coef, color=color)
+        ax1.plot(loss[:, 1], color=color)
 
         ax2 = ax1.twinx()
 
-        color = 'orange'
+        color = 'tab:orange'
         ax2.set_ylabel('constrain', color=color)  # we already handled the x-label with ax1
         ax2.tick_params(axis='y', labelcolor=color)
-        ax2.plot(loss[:, 2] / (cloth_sim.mass / n_frame / dt ** 2) ** 2, color=color)
+        ax2.plot(loss[:, 2], color=color)
 
         fig.tight_layout()
 

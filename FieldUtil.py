@@ -9,6 +9,9 @@ def scale(x: ti.template(), a: ti.f32):
 
 @ti.kernel
 def axpy(a: ti.f32, x: ti.template(), y: ti.template()):
+    """
+    y += a * x
+    """
     for I in ti.grouped(y):
         y[I] += a * x[I]
 
