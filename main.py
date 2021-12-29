@@ -16,6 +16,8 @@ ti.init(arch=ti.cpu, debug=False)
 
 # display/output params
 b_display = False
+b_visualize = False
+vis_path = "checkpoints\\2021-12-27 13-57-30\\epoch_100"
 b_save_every_epoch = True
 b_save_npy = True
 b_verbose = False
@@ -36,8 +38,8 @@ ie_cg_err = 1e-12
 n_frame = 80
 dt = 0.01
 sim_med = "implicit"  # implicit, symplectic, XPBD
-iter = 500 if sim_med == "XPBD" else 5  # only for implicit Euler / XPBD
-sim_err = 1e-6  # only for implicit Euler / XPBD
+iter = 500 if sim_med == "XPBD" else 3  # only for implicit Euler / XPBD
+sim_err = 1e-12  # only for implicit Euler / XPBD
 use_attach = True
 use_spring = True
 use_stretch = False
@@ -46,19 +48,19 @@ k_spring = 500
 k_attach = 1e5
 
 # optimization params
-opt_med = "projected Newton"  # gradient, projected Newton, SAP, Gauss-Newton
-n_epoch = 200
+opt_med = "Gauss-Newton"  # gradient, projected Newton, SAP, Gauss-Newton, L-BFGS
+n_epoch = 50
 ## force based opt params
 opt_sim_med = "implicit"  # implicit, symplectic
-desc_rate = 0.01  # start step sizegit
-regl_coef = 0.01
+desc_rate = 0.01  # start step size
+regl_coef = 1e-4
 ## position based opt params
-b_soft_con = False if opt_med == "SAP" or opt_med == "projected Newton" else True
-init_med = "fix"  # static, solve (0 physical loss), fix (0 constrain loss), load (mixed loss)
+b_soft_con = False if opt_med == "SAP" or opt_med == "projected Newton" else False
+init_med = "load"  # static, solve (0 physical loss), fix (0 constrain loss), load (mixed loss)
 ### Gauss-Newton linear solver params
 b_matrix_free = False
 gn_integration = "implicit"  # implicit, symplectic
-gn_solver = "direct"  # direct, cg
+gn_solver = "direct"  # direct, L-BFGS
 gn_cg_precond = "None"
 gn_cg_iter_ratio = 1.0
 gn_cg_err = 1e-12
@@ -160,11 +162,11 @@ def optimize():
             opt.save_trajectory(epoch_dir, b_save_npy)
             opt.save_frame(epoch_dir)
 
-    visualize()
+    visualize(np.array(opt.loss_list), np.array(opt.loss_per_frame))
 
-def visualize():
-    loss = np.array(opt.loss_list)
-    loss_per_frame = np.roll(np.array(opt.loss_per_frame), 2, axis=1)
+def visualize(loss, loss_per_frame):
+    # loss_per_frame = np.roll(loss_per_frame, 2, axis=1)
+    loss_per_frame = np.roll(loss_per_frame, 1, axis=1)[:, :-2]
 
     fig, ax1 = plt.subplots()
 
@@ -173,7 +175,8 @@ def visualize():
         ax1.set_xlabel('iter')
         ax1.set_ylabel('loss', color=color)
         ax1.tick_params(axis='y', labelcolor=color)
-        ax1.plot(loss[:, 0])
+        # ax1.plot(loss[:, 0])
+        ax1.plot(loss)
     else:
         color = 'tab:blue'
         ax1.set_xlabel('iter')
@@ -194,9 +197,9 @@ def visualize():
     plt.close()
 
     fig, axis = plt.subplots(1, 1)
-    axis.set_xlim(0, n_frame)
-    # axis.set_ylim(0, loss_per_frame.max())
-    data = axis.plot(np.arange(n_frame))[0]
+    axis.set_xlim(0, n_frame - 2)
+    axis.set_ylim(0, loss_per_frame.max())
+    data = axis.plot(np.arange(n_frame - 2))[0]
 
     def update(i):
         data.set_ydata(loss_per_frame[i])
@@ -211,5 +214,9 @@ def visualize():
 if __name__ == "__main__":
     if b_display:
         display()
+    elif b_visualize:
+        loss = np.load(os.path.join(vis_path, "loss.npy"))
+        loss_per_frame = np.load(os.path.join(vis_path, "loss_per_frame.npy"))
+        visualize(loss, loss_per_frame)
     else:
         optimize()

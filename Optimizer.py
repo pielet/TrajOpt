@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import taichi as ti
+from collections import deque
 from FieldUtil import *
 from LinearSolver import LinearSolver
 
@@ -10,7 +11,8 @@ class Optimizer:
         "gradient": 0,             # f (soft constrain)
         "projected Newton": 1,   # f (linearized hard constrain)
         "SAP": 2,          # f (linearized constrain)
-        "Gauss-Newton": 3  # x
+        "Gauss-Newton": 3,  # x
+        "L-BFGS": 4  # f (L-BFGS)
     }
 
     def __init__(self,
@@ -48,13 +50,21 @@ class Optimizer:
 
         # forced based optimization
         self.sim_med = sim_med
-        self.desc_rate = desc_rate
         self.epsilon = smoothness
 
         ## adjoint method
         self.adjoint_vec = ti.Vector.field(3, ti.f32, n_frame * self.n_vert)
         self.linear_solver = linear_solver
         self.b = linear_solver.b
+
+        ## L-BFGS
+        self.window_size = 10
+        self.cur_window_size = 0
+        self.last_x = ti.Vector.field(3, ti.f32, self.n_vert * n_frame)
+        self.last_g = ti.Vector.field(3, ti.f32, self.n_vert * n_frame)
+        self.delta_x_history = deque([ti.Vector.field(3, ti.f32, self.n_vert * n_frame) for _ in range(self.window_size)])
+        self.delta_g_history = deque([ti.Vector.field(3, ti.f32, self.n_vert * n_frame) for _ in range(self.window_size)])
+        self.pho = deque([0.0 for _ in range(self.window_size)])
 
         ## Lagrangian
         self.L = 0.0
@@ -70,7 +80,7 @@ class Optimizer:
             self.tmp_hess = ti.Matrix.field(3, 3, ti.f32)
             self.tmp_hess_pointer = ti.root.pointer(ti.ij, self.n_vert)
             self.tmp_hess_pointer.place(self.tmp_hess)
-        if self.linear_solver_type == "cg":
+        if self.linear_solver_type == "L-BFGS":
             self.x_linear_solver = LinearSolver((n_frame - 2) * self.n_vert, cg_precond,
                                                 int(cg_iter_ratio * (n_frame - 2) * self.n_vert * 3), cg_err)
 
@@ -179,6 +189,8 @@ class Optimizer:
         if b_save_npy:
             np.save(os.path.join(output_dir, "trajectory.npy"), np_traj)
             np.save(os.path.join(output_dir, "control_force.npy"), np_force)
+            np.save(os.path.join(output_dir, "loss.npy"), np.array(self.loss_list))
+            np.save(os.path.join(output_dir, "loss_per_frame.npy"), np.array(self.loss_per_frame))
 
     def save_frame(self, output_dir):
         """
@@ -206,7 +218,7 @@ class Optimizer:
             writer.export_frame(i, os.path.join(output_dir, "frame"))
 
     def compute_init_loss(self):
-        if self.method == self.OptimizeMethod["gradient"]:
+        if self.method == self.OptimizeMethod["gradient"] or self.method == self.OptimizeMethod["L-BFGS"]:
             self.loss, self.force_loss, self.constrain_loss, loss_info = self.compute_soft_constrain_loss(self.control_force)
             self.loss_list.append([self.loss, self.force_loss, self.constrain_loss])
             self.loss_per_frame.append(loss_info)
@@ -279,20 +291,62 @@ class Optimizer:
         self.get_frame(self.trajectory, self.n_frame - 2, self.tmp_vec)
         axpy(-1.0, self.x0, self.tmp_vec)
         reduce(self.sum, self.tmp_vec, self.tmp_vec)
-        constrain_loss = 0.5 * (self.mass / self.n_frame / self.dt ** 2) ** 2 * self.sum[None]
+        constrain_loss = 0.5 * self.sum[None]
 
         self.get_frame(self.trajectory, self.n_frame - 1, self.tmp_vec)
         axpy(-1.0, self.x1, self.tmp_vec)
         reduce(self.sum, self.tmp_vec, self.tmp_vec)
-        constrain_loss += 0.5 * (self.mass / self.n_frame / self.dt ** 2) ** 2 * self.sum[None]
+        constrain_loss += 0.5 * self.sum[None]
+
+        constrain_loss *= (self.mass / self.n_frame / self.dt ** 2) ** 2
 
         return force_loss + constrain_loss, force_loss, constrain_loss, loss_per_frame
 
     def compute_soft_constrain_ascent_dir(self):
-        self.ascent_dir.copy_from(self.adjoint_vec)
-        axpy(self.epsilon, self.control_force, self.ascent_dir)
-        scale(self.ascent_dir, self.desc_rate)
-        self.gradient.copy_from(self.ascent_dir)
+        self.gradient.copy_from(self.adjoint_vec)
+        axpy(self.epsilon, self.control_force, self.gradient)
+        self.ascent_dir.copy_from(self.gradient)
+
+    def compute_L_BFGS_ascent_dir(self):
+        self.gradient.copy_from(self.adjoint_vec)
+        axpy(self.epsilon, self.control_force, self.gradient)
+
+        if self.cur_epoch == 0:
+            self.ascent_dir.copy_from(self.gradient)
+        else:
+            # enque
+            self.delta_x_history.rotate(1)
+            self.delta_x_history[0].copy_from(self.trajectory)
+            axpy(-1.0, self.last_x, self.delta_x_history[0])
+
+            self.delta_g_history.rotate(1)
+            self.delta_g_history[0].copy_from(self.gradient)
+            axpy(-1.0, self.last_g, self.delta_g_history[0])
+
+            self.pho.rotate(1)
+            reduce(self.sum, self.delta_x_history[0], self.delta_g_history[0])
+            self.pho[0] = 1.0 / self.sum[None]
+
+            self.cur_window_size = min(self.window_size, self.cur_window_size + 1)
+
+            # compute ascent dir
+            self.ascent_dir.copy_from(self.gradient)
+            alpha = []
+            for i in range(self.cur_window_size):
+                reduce(self.sum, self.ascent_dir, self.delta_x_history[i])
+                alpha.append(self.pho[i] * self.sum[None])
+                axpy(-alpha[-1], self.delta_g_history[i], self.ascent_dir)
+
+            reduce(self.sum, self.delta_x_history[0], self.delta_g_history[0])
+            gamma = self.sum[None]
+            reduce(self.sum, self.delta_g_history[0], self.delta_g_history[0])
+            gamma /= self.sum[None]
+            scale(self.ascent_dir, gamma)
+
+            for i in reversed(range(self.cur_window_size)):
+                reduce(self.sum, self.ascent_dir, self.delta_g_history[i])
+                beta = self.pho[i] * self.sum[None]
+                axpy(alpha[i] - beta, self.delta_x_history[i], self.ascent_dir)
 
     def compute_position_loss(self, trajectory):
         loopy_loss = 0.0
@@ -351,13 +405,10 @@ class Optimizer:
             self.set_frame(self.control_force, i, self.ELeq)
 
     def compute_position_ascent_dir(self):
-        if self.linear_solver_type == "cg":
-            self.position_solve_cg()
-        elif self.linear_solver_type == "direct":
-            if self.b_soft_con:
-                self.position_soft_con_solve_direct()
-            else:
-                self.position_solve_direct()
+        if self.b_soft_con:
+            self.position_soft_con_solve_direct()
+        else:
+            self.position_solve_direct()
 
     def position_soft_con_solve_direct(self):
         @ti.kernel
@@ -493,121 +544,6 @@ class Optimizer:
 
         self.ascent_dir.from_numpy(dx.reshape([-1, 3]))
 
-    def position_solve_cg(self):
-        print("[CG]: compute gradient and hessian")
-        self.extend_x.fill(0.0)
-        M_h2 = self.mass / (self.dt * self.dt)
-        # np.save("debug/M_h2.npy", [M_h2])
-        for i in range(self.n_frame):
-            # Euler-Lagragian eqution
-            self.get_frame(self.trajectory, (i + 1) % self.n_frame, self.ELeq)
-            self.get_frame(self.trajectory, (i - 1) % self.n_frame, self.tmp_vec)
-            axpy(1.0, self.tmp_vec, self.ELeq)
-            self.get_frame(self.trajectory, i, self.tmp_vec)
-            axpy(-2.0, self.tmp_vec, self.ELeq)
-            scale(self.ELeq, M_h2)
-
-            self.cloth_sim.compute_gradient(self.tmp_vec, False)
-            # save(f"iter_{self.cur_epoch}_x_{i}.npy", self.tmp_vec)
-            # save(f"iter_{self.cur_epoch}_grad_{i}.npy", self.cloth_sim.gradient)
-            axpy(1.0, self.cloth_sim.gradient, self.ELeq)
-
-            # accumulate to adjacent gradient
-            self.cloth_sim.compute_hessian(self.tmp_vec, False)  # self.tmp_vec = x_i
-            # save(f"iter_{self.cur_epoch}_hess_{i}.npy", self.cloth_sim.hessian)
-            if self.b_matrix_free:
-                self.set_hessian(i, self.cloth_sim.hessian)
-
-            self.tmp_vec.copy_from(self.ELeq)
-            scale(self.tmp_vec, M_h2)  # self.tmp_vec = M/h^2 * ELeq
-            self.add_to_frame(self.extend_x, (i - 1) % self.n_frame, self.tmp_vec)
-            self.add_to_frame(self.extend_x, (i + 1) % self.n_frame, self.tmp_vec)
-            scale(self.tmp_vec, -2.0)  # self.tmp_vec = -2M/h^2 * ELeq
-            self.add_to_frame(self.extend_x, i, self.tmp_vec)
-
-            self.tmp_vec.fill(0.0)
-            sparse_mv(self.cloth_sim.hessian, self.ELeq, self.tmp_vec)  # assume \grad^2 U is symmetric
-            self.add_to_frame(self.extend_x, i, self.tmp_vec)
-
-            if not self.b_matrix_free:
-                self.cloth_sim.add_in_diagonal(-2.0 * M_h2)
-
-                # M/h^2 & M/h^2
-                self.add_in_block_diagonal((i - 1) % self.n_frame, (i - 1) % self.n_frame, M_h2 * M_h2)
-                self.add_in_block_diagonal((i - 1) % self.n_frame, (i + 1) % self.n_frame, M_h2 * M_h2)
-                self.add_in_block_diagonal((i + 1) % self.n_frame, (i - 1) % self.n_frame, M_h2 * M_h2)
-                self.add_in_block_diagonal((i + 1) % self.n_frame, (i + 1) % self.n_frame, M_h2 * M_h2)
-
-                # M/h^2 * A
-                sparse_set_zero(self.tmp_hess)
-                sparse_copy(self.cloth_sim.hessian, self.tmp_hess)
-                scale(self.tmp_hess, M_h2)
-                self.add_in_block_sparse(i, (i - 1) % self.n_frame, self.tmp_hess)
-                self.add_in_block_sparse(i, (i + 1) % self.n_frame, self.tmp_hess)
-                self.add_in_block_sparse((i - 1) % self.n_frame, i, self.tmp_hess)
-                self.add_in_block_sparse((i + 1) % self.n_frame, i, self.tmp_hess)
-
-                # A^T @ A
-                sparse_set_zero(self.tmp_hess)
-                sparse_ATA(self.n_vert, self.cloth_sim.hessian, self.cloth_sim.hessian_pointer, self.tmp_hess)
-                self.add_in_block_sparse(i, i, self.tmp_hess)
-
-        # save(f"iter_{self.cur_epoch}_full_grad.npy", self.extend_x)
-        large_to_small(self.extend_x, self.x_linear_solver.b)
-        if not self.b_matrix_free:
-            # save(f"iter_{self.cur_epoch}_full_hess.npy", self.hess)
-            large_to_small_sparse(self.hess, self.x_linear_solver.A, (self.n_frame - 2) * self.n_vert)
-
-        def ATAx(x, Ax):
-            # extent x
-            self.extend_x.fill(0.0)
-            small_to_large(x, self.extend_x)
-
-            self.extend_Ax.fill(0.0)
-            for i in range(self.n_frame):
-                # Ax
-                self.get_frame(self.extend_x, (i + 1) % self.n_frame, self.x_bar)
-                self.get_frame(self.extend_x, (i - 1) % self.n_frame, self.tmp_vec)
-                axpy(1.0, self.tmp_vec, self.x_bar)
-                self.get_frame(self.extend_x, i, self.tmp_vec)  # self.tmp_vec = \delta x_i
-                axpy(-2.0, self.tmp_vec, self.x_bar)
-                scale(self.x_bar, self.mass / (self.dt * self.dt))
-
-                self.get_hessian(i, self.cloth_sim.hessian)
-
-                self.ELeq.fill(0.0)
-                sparse_mv(self.cloth_sim.hessian, self.tmp_vec, self.ELeq)
-                axpy(1.0, self.ELeq, self.x_bar)
-
-                # ATAx
-                self.tmp_vec.copy_from(self.x_bar)
-                scale(self.tmp_vec, self.mass / (self.dt * self.dt))  # self.tmp_vec = M/h^2 * x_bar
-                self.add_to_frame(self.extend_Ax, (i - 1) % self.n_frame, self.tmp_vec)
-                self.add_to_frame(self.extend_Ax, (i + 1) % self.n_frame, self.tmp_vec)
-                scale(self.tmp_vec, -2.0)  # self.tmp_vec = -2M/h^2 * ELeq
-                self.add_to_frame(self.extend_Ax, i, self.tmp_vec)
-
-                self.tmp_vec.fill(0.0)
-                sparse_mv(self.cloth_sim.hessian, self.x_bar, self.tmp_vec)
-                self.add_to_frame(self.extend_Ax, i, self.tmp_vec)
-
-            # clamp Ax
-            large_to_small(self.extend_Ax, Ax)
-
-        if self.b_matrix_free:
-            self.x_linear_solver.compute_Ap = ATAx
-
-        # linear solve
-        print("[CG]: start")
-        self.x_ascent_dir.fill(0.0)
-        self.x_linear_solver.conjugate_gradient(self.x_ascent_dir, b_verbose=True)
-        self.ascent_dir.fill(0.0)
-        small_to_large(self.x_ascent_dir, self.ascent_dir)
-        # print("[start direct solver]")
-        # np_ascent_dir = np.linalg.solve(np.swapaxes(self.x_linear_solver.A.to_numpy(), 1, 2).reshape([3 * self.n_vert * (self.n_frame - 2), -1]), self.x_linear_solver.b.to_numpy().flatten())
-        # self.x_ascent_dir.from_numpy(np_ascent_dir.reshape([-1, 3]))
-        # small_to_large(self.x_ascent_dir, self.ascent_dir)
-
     def position_solve_direct(self):
         @ti.kernel
         def add_in_block_diagonal(A: ti.linalg.sparse_matrix_builder(), fi: ti.i32, fj: ti.i32, a: ti.f32):
@@ -737,19 +673,59 @@ class Optimizer:
         small_to_large(self.x_ascent_dir, self.gradient)
         hess = hess_builder.build()
 
-        # print(self.gradient)
-        # print(hess)
-
-        print("[LLT]: solve")
         solver = ti.linalg.SparseSolver(solver_type="LLT")
         solver.analyze_pattern(hess)
         solver.factorize(hess)
-        dx = solver.solve(self.x_ascent_dir.to_numpy().flatten())
-        b_success = solver.info()
 
-        if not b_success:
-            print("[LLT]: solver failed. EXIT.")
-            exit(-1)
+        if self.linear_solver_type == "direct" or self.cur_epoch == 0:
+            print("[LLT]: solve")
+            dx = solver.solve(self.x_ascent_dir.to_numpy().flatten())
+            b_success = solver.info()
+
+            if not b_success:
+                print("[LLT]: solver failed. EXIT.")
+                exit(-1)
+        elif self.linear_solver_type == "L-BFGS":
+            print("[L-BFGS]: solve")
+            # enque
+            self.delta_x_history.rotate(1)
+            self.delta_x_history[0].copy_from(self.trajectory)
+            axpy(-1.0, self.last_x, self.delta_x_history[0])
+
+            self.delta_g_history.rotate(1)
+            self.delta_g_history[0].copy_from(self.gradient)
+            axpy(-1.0, self.last_g, self.delta_g_history[0])
+
+            self.pho.rotate(1)
+            reduce(self.sum, self.delta_x_history[0], self.delta_g_history[0])
+            self.pho[0] = 1.0 / self.sum[None]
+
+            self.cur_window_size = min(self.window_size, self.cur_window_size + 1)
+
+            # compute ascent dir
+            self.ascent_dir.copy_from(self.gradient)
+            alpha = []
+            for i in range(self.cur_window_size):
+                reduce(self.sum, self.ascent_dir, self.delta_x_history[i])
+                alpha.append(self.pho[i] * self.sum[None])
+                axpy(-alpha[-1], self.delta_g_history[i], self.ascent_dir)
+
+            large_to_small(self.ascent_dir, self.x_ascent_dir)
+            dx = solver.solve(self.x_ascent_dir.to_numpy().flatten())
+            b_success = solver.info()
+
+            if not b_success:
+                print("[LLT]: solver failed. EXIT.")
+                exit(-1)
+
+            self.x_ascent_dir.from_numpy(dx.reshape([-1, 3]))
+            self.ascent_dir.fill(0.0)
+            small_to_large(self.x_ascent_dir, self.ascent_dir)
+
+            for i in reversed(range(self.cur_window_size)):
+                reduce(self.sum, self.ascent_dir, self.delta_g_history[i])
+                beta = self.pho[i] * self.sum[None]
+                axpy(alpha[i] - beta, self.delta_x_history[i], self.ascent_dir)
 
         self.x_ascent_dir.from_numpy(dx.reshape([-1, 3]))
         self.ascent_dir.fill(0.0)
@@ -776,13 +752,20 @@ class Optimizer:
 
             print("step size: %f  loss: %.1f  threshold: %.1f" % (step_size, cur_loss, self.loss + step_size * threshold))
 
-            if cur_loss < self.loss + step_size * threshold or step_size < 1e-6:
+            if cur_loss < self.loss + step_size * threshold or step_size < 1e-10:
                 break
             step_size *= self.ls_alpha
 
         # commit control force
         self.step_size = step_size
+        if self.method == self.OptimizeMethod["L-BFGS"] or self.linear_solver_type == "L-BFGS":
+            self.last_x.copy_from(var)
+            self.last_g.copy_from(self.gradient)
         var.copy_from(self.tentative)
+
+        b_converge = True
+        if np.abs(self.loss - cur_loss) / self.loss < 1e-5:
+            b_converge = False
 
         if self.method == self.OptimizeMethod["Gauss-Newton"]:
             self.loss, self.loopy_loss, self.constrain_loss = cur_loss, cur_f_loss, cur_c_loss
@@ -793,7 +776,7 @@ class Optimizer:
             self.loss_list.append([self.loss, self.force_loss, self.constrain_loss])
             self.loss_per_frame.append(loss_info)
 
-        return self.loss < 1e-6
+        return b_converge
 
     def compute_Lagragian_loss(self, control_force, L):
         self.forward(control_force)
@@ -936,6 +919,9 @@ class Optimizer:
             if self.method == self.OptimizeMethod["gradient"]:
                 print("[start gradient descent]")
                 b_converge = self.line_search(self.control_force, self.compute_soft_constrain_loss, self.compute_soft_constrain_ascent_dir)
+            elif self.method == self.OptimizeMethod["L-BFGS"]:
+                print("[start L-BFGS]")
+                b_converge = self.line_search(self.control_force, self.compute_soft_constrain_loss, self.compute_L_BFGS_ascent_dir)
             elif self.method == self.OptimizeMethod["projected Newton"]:
                 print("[start projected gradient]")
                 b_converge = self.projected_newton(False)

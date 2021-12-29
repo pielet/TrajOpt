@@ -15,8 +15,17 @@
   * Quasi-Newton
   * SAP
 * Med2
-  * 全0初始化 LLT 解不出来
-  * implicit Euler 初始化，symplectic 做优化等式接出来 loss (virtual force) 贼大
+  * implicit Euler 初始化，symplectic 做优化等式接出来 loss (virtual force) 贼大 -> 所以就用 implicit 啊...
+  * forward 初始化
+    * 收敛很慢，loss 主要分布在两端，所以一直是在努力降两头的loss -> 只可视化中间的看看？
+  * 全0初始化
+    * 初始的loss就比 forward simulation 初始化跑200次迭代还小了...
+    * 会收敛到 trivial solution (诡异的飘在空中)
+    * (LLT 偶尔会 fail)
+  * SAP 初始化
+    * 两头的 loss 会进一步降低 -> 只可视化中间的看看？-> 中间的也降了，只不过这个 SAP intial guess 对于 loopy loss 来说还是两头的很大
+  * soft constrain
+    * ？甩的挺高
 
 #### Impl
 
